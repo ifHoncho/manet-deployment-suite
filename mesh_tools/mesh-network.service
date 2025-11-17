@@ -6,12 +6,14 @@ Wants=network-online.target
 [Service]
 Type=simple
 # ExecStartPre=/usr/sbin/set-mac.sh # Removed: Now called internally by mesh-network.sh
-ExecStart=/usr/sbin/mesh-network.sh service
+ExecStart=/usr/sbin/mesh-network.sh
 ExecStop=/usr/sbin/mesh-network-stop.sh
 Restart=on-failure
 RestartSec=5
-StandardOutput=journal
+StandardOutput=append:/var/log/mesh-network/mesh-network.log
 StandardError=journal
+LogsDirectory=mesh-network
+LogsDirectoryMode=0755
 TimeoutStartSec=60
 TimeoutStopSec=30
 

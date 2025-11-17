@@ -8,10 +8,30 @@ if [ -f /etc/mesh-network/mesh-config.conf ]; then
     rm /tmp/mesh-config-filtered.conf
 fi
 
-# Set up logging
-LOG_FILE="/var/log/mesh-network.log"
-exec 1> >(tee -a "${LOG_FILE}")
-exec 2>&1
+# Set up logging shared with mesh-network.sh, fallback to journald if necessary
+LOG_DIR="/var/log/mesh-network"
+LOG_FILE="${LOG_DIR}/mesh-network.log"
+LOG_REDIRECTED=false
+
+if mkdir -p "${LOG_DIR}" 2>/dev/null && touch "${LOG_FILE}" 2>/dev/null; then
+    chmod 755 "${LOG_DIR}" 2>/dev/null || true
+    chmod 644 "${LOG_FILE}" 2>/dev/null || true
+    exec 1>>"${LOG_FILE}"
+    exec 2>>"${LOG_FILE}"
+    LOG_REDIRECTED=true
+fi
+
+if [ "${LOG_REDIRECTED}" != true ]; then
+    if command -v systemd-cat >/dev/null 2>&1; then
+        exec 1> >(systemd-cat -t mesh-network-stop)
+        exec 2>&1
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] STOP: Falling back to journald logging" >&2
+    else
+        exec 1>>/tmp/mesh-network-stop.log
+        exec 2>&1
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] STOP: Logging to /tmp/mesh-network-stop.log due to permission issues" >&2
+    fi
+fi
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] STOP: $1"

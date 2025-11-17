@@ -15,13 +15,13 @@ setup_logging() {
     LOG_FILE="${LOG_DIR}/mesh-network.log"
     
     # Create log directories if they don't exist
-    sudo mkdir -p "${LOG_OLD_DIR}" 2>/dev/null || {
+    mkdir -p "${LOG_OLD_DIR}" 2>/dev/null || {
         echo "Error: Could not create log directories"
         exit 1
     }
     
     # Ensure proper permissions on log directories
-    sudo chmod 755 "${LOG_DIR}" "${LOG_OLD_DIR}" 2>/dev/null || {
+    chmod 755 "${LOG_DIR}" "${LOG_OLD_DIR}" 2>/dev/null || {
         echo "Error: Could not set permissions on log directories"
         exit 1
     }
@@ -30,8 +30,15 @@ setup_logging() {
     if [ -f "${LOG_FILE}" ]; then
         # Create timestamp for the backup filename
         TIMESTAMP=$(date '+%Y%m%d-%H%M%S')
-        # Move current log to backup with timestamp
-        mv "${LOG_FILE}" "${LOG_OLD_DIR}/mesh-network.log.${TIMESTAMP}"
+        
+        # Copy & truncate so systemd's file descriptor stays valid
+        if cp "${LOG_FILE}" "${LOG_OLD_DIR}/mesh-network.log.${TIMESTAMP}" 2>/dev/null; then
+            chmod 640 "${LOG_OLD_DIR}/mesh-network.log.${TIMESTAMP}" 2>/dev/null || true
+            truncate -s 0 "${LOG_FILE}" 2>/dev/null
+        else
+            log_warn "Failed to back up ${LOG_FILE}; skipping truncate to avoid data loss"
+        fi
+        
         # Log rotation message to the new file once it's created
         ROTATION_MESSAGE="Log file rotated at $(date '+%Y-%m-%d %H:%M:%S'). Previous log saved as ${LOG_OLD_DIR}/mesh-network.log.${TIMESTAMP}"
         
@@ -48,23 +55,11 @@ setup_logging() {
     fi
     
     # Create new log file and set permissions
-    sudo touch "${LOG_FILE}" 2>/dev/null
-    sudo chmod 644 "${LOG_FILE}" 2>/dev/null || {
+    touch "${LOG_FILE}" 2>/dev/null
+    chmod 644 "${LOG_FILE}" 2>/dev/null || {
         echo "Error: Could not set permissions on log file"
         exit 1
     }
-    
-    # Check if running as a service
-    # It is always running as a service. Occurances of this check need to be looked into and factored out.
-    if [ "${1}" = "service" ]; then
-        # Redirect output to log file without tee when running as a service
-        exec 1>> "${LOG_FILE}"
-        exec 2>> "${LOG_FILE}"
-    else
-        # Keep the existing tee logging for interactive use
-        exec 1> >(tee -a "${LOG_FILE}")
-        exec 2>&1
-    fi
     
     # Output rotation message if we rotated the log
     if [ -n "${ROTATION_MESSAGE}" ]; then
@@ -81,6 +76,15 @@ setup_logging() {
 # WARN: Warning conditions that don't interrupt operation but should be noted
 # ERROR: Error conditions that affect functionality
 LOG_LEVEL=1
+
+# Global routing state shared between monitor and helper functions
+current_gateway=""
+last_known_mesh_gateway=""
+primary_route_configured=false
+fallback_route_configured=false
+
+# Script is always run as a managed service
+
 
 log_debug() {
     if [ $LOG_LEVEL -le 0 ]; then
@@ -107,12 +111,35 @@ log_error() {
 }
 
 log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >&2
+    local formatted="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo "${formatted}"
+    echo "${formatted}" >&2
 }
 
 error() {
     log_error "$1"
     exit 1
+}
+
+store_generated_password() {
+    local password_value="$1"
+    local store_dir="/var/lib/mesh-network"
+    local store_file="${store_dir}/generated-wap-password"
+    
+    if ! mkdir -p "${store_dir}" 2>/dev/null; then
+        log_warn "Unable to create password storage directory at ${store_dir}"
+        return 1
+    fi
+    
+    chmod 700 "${store_dir}" 2>/dev/null || true
+    
+    if ! printf "%s\n" "${password_value}" > "${store_file}"; then
+        log_warn "Unable to persist generated WAP password to ${store_file}"
+        return 1
+    fi
+    
+    chmod 600 "${store_file}" 2>/dev/null || true
+    log_info "Stored generated WAP password at ${store_file} (root access required)"
 }
 
 # Get batman-adv MAC address for the node
@@ -1271,13 +1298,15 @@ setup_hostapd() {
     fi
     
     if [ -z "${WAP_PASSWORD}" ]; then
-        log "WAP_PASSWORD not defined, using default random password"
+        log "WAP_PASSWORD not defined, generating secure random password"
         WAP_PASSWORD=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 12)
-        log "Generated random WAP password: ${WAP_PASSWORD}"
+        store_generated_password "${WAP_PASSWORD}"
+        log_info "Generated random WAP password (value hidden)"
     elif [ ${#WAP_PASSWORD} -lt 8 ]; then
         log "Warning: WAP_PASSWORD is too short. Using random password instead."
         WAP_PASSWORD=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 12)
-        log "Generated random WAP password: ${WAP_PASSWORD}"
+        store_generated_password "${WAP_PASSWORD}"
+        log_info "Generated random WAP password (value hidden)"
     fi
     
     if [ -z "${WAP_CHANNEL}" ]; then
@@ -1796,12 +1825,12 @@ monitor_mesh_network() {
     
     log_debug "Detected current batman-adv gateway mode: ${current_mode}"
     
-    local current_gateway=""  # Track current gateway IP
-    local last_known_mesh_gateway=""  # Track last known good mesh gateway for fallback
+    current_gateway=""  # Track current gateway IP
+    last_known_mesh_gateway=""  # Track last known good mesh gateway for fallback
     local wan_available=false  # Track WAN availability
     local previous_wan_state=false  # Track previous WAN state for change detection
-    local primary_route_configured=false  # Track if primary route is configured
-    local fallback_route_configured=false  # Track if fallback route is configured
+    primary_route_configured=false  # Track if primary route is configured
+    fallback_route_configured=false  # Track if fallback route is configured
     local active_wan=""  # Track active WAN interface
     local force_mode_switching=true  # Always allow mode switching
     local wan_stable_count=0  # Counter for stable WAN detection (debouncing)
@@ -2574,16 +2603,9 @@ setup_mesh_network() {
     setup_interfaces_and_services
     
     # Log successful completion
-    log_info "==== MESH NETWORK SETUP ===="
-    
-    # Start monitoring service in a background loop for auto mode
     log_info "==== MESH NETWORK SETUP COMPLETE ===="
     
-    # Start monitoring service
-    log_info "==== STARTING MONITORING SERVICE ===="
-    
-    log_info "Starting monitor with auto mode enabled"
-    monitor_mesh_network
+    return 0
 }
 
 
@@ -2598,14 +2620,10 @@ log_info "==== MESH NETWORK SETUP ===="
 setup_mesh_network
 log_info "==== MESH NETWORK SETUP COMPLETE ===="
 
-# If running as a service, start monitoring
-if [ "${1}" = "service" ]; then
-    log_info "==== STARTING MONITORING SERVICE ===="
-    # Pass the original command line args to the monitor function
-    if [ "${BATMAN_GW_MODE}" = "auto" ]; then
-        log_info "Starting monitor with auto mode enabled"
-        monitor_mesh_network "auto"
-    else
-        monitor_mesh_network "${BATMAN_GW_MODE}"
-    fi
+log_info "==== STARTING MONITORING SERVICE ===="
+if [ "${BATMAN_GW_MODE}" = "auto" ]; then
+    log_info "Starting monitor with auto mode enabled"
+    monitor_mesh_network "auto"
+else
+    monitor_mesh_network "${BATMAN_GW_MODE}"
 fi

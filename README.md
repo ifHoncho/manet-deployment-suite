@@ -66,7 +66,7 @@ Common applications include:
 
 ### Software Requirements
 - This tool is optimized for Ubuntu 22.04. Other Debian-based distributions are supported, but variations in their default network management tools might necessitate configuration adjustments or disabling specific components.
-- Required packages:
+- Required packages (also listed in `requirements/packages.txt`). The `setup.sh` script installs or updates everything on that list automatically, but you can install them manually with:
   ```bash
   sudo apt install batctl iw wireless-tools network-manager net-tools bridge-utils iptables dnsmasq hostapd arping arp-scan bc
   ```
@@ -78,8 +78,8 @@ Common applications include:
 # Update system
 sudo apt update && sudo apt upgrade -y
 
-# Install dependencies
-sudo apt install -y git batctl iw wireless-tools net-tools bridge-utils iptables dnsmasq hostapd arp-scan bc
+# Install git (setup.sh installs all mesh dependencies automatically)
+sudo apt install -y git
 
 # Clone repository
 git clone https://github.com/ifHoncho/manet-deployment-suite.git
@@ -97,6 +97,8 @@ sudo systemctl enable mesh-network.service
 sudo systemctl start mesh-network.service
 
 # Optional: view logs to see what's happening
+sudo journalctl -u mesh-network.service -f
+# A copy is also written to /var/log/mesh-network/mesh-network.log
 tail -f /var/log/mesh-network/mesh-network.log
 ```
 
@@ -149,6 +151,8 @@ BATMAN_ORIG_INTERVAL=1000 # Originator interval (ms)
 BATMAN_HOP_PENALTY=30     # Hop penalty
 BATMAN_ROUTING_ALGORITHM=BATMAN_V  # BATMAN_IV or BATMAN_V Note that BATMAN_V is only supported in newer versions of batctl
 ```
+
+If you leave `WAP_PASSWORD` blank (or shorter than 8 characters), the service generates a strong random password automatically. The current value is written to `/var/lib/mesh-network/generated-wap-password`, which is readable only by root.
 
 ### Hardware Interface Management
 

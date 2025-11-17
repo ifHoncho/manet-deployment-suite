@@ -7,28 +7,58 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # --- Check for required packages ---
-REQUIRED_PACKAGES="batctl iw wireless-tools network-manager net-tools bridge-utils iptables dnsmasq hostapd arping arp-scan bc"
-MISSING_PACKAGES=""
+SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REQUIREMENTS_FILE="${SCRIPT_DIR}/requirements/packages.txt"
+
+if [ ! -f "${REQUIREMENTS_FILE}" ]; then
+    echo "Error: requirements file not found at ${REQUIREMENTS_FILE}"
+    exit 1
+fi
+
+REQUIRED_PACKAGES=()
+while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+        ''|\#*)
+            continue
+            ;;
+        *)
+            REQUIRED_PACKAGES+=("$line")
+            ;;
+    esac
+done < "${REQUIREMENTS_FILE}"
+
+if [ ${#REQUIRED_PACKAGES[@]} -eq 0 ]; then
+    echo "Error: requirements file ${REQUIREMENTS_FILE} does not list any packages."
+    exit 1
+fi
+
+MISSING_PACKAGES=()
 
 echo "Checking for required packages..."
-for pkg in $REQUIRED_PACKAGES; do
+for pkg in "${REQUIRED_PACKAGES[@]}"; do
     if ! dpkg -s "$pkg" > /dev/null 2>&1; then
-        MISSING_PACKAGES="$MISSING_PACKAGES $pkg"
+        MISSING_PACKAGES+=("$pkg")
     fi
 done
 
-if [ -n "$MISSING_PACKAGES" ]; then
-    echo "Error: The following required packages are not installed:"
-    echo " $MISSING_PACKAGES"
+if [ ${#MISSING_PACKAGES[@]} -ne 0 ]; then
+    echo "The following required packages are missing:"
+    printf ' - %s\n' "${MISSING_PACKAGES[@]}"
     echo
-    echo "Please install them using the following command:"
-    echo "sudo apt update && sudo apt install -y$MISSING_PACKAGES"
-    echo
-    echo "If you get an error from dnsmasq saying 'Failed to start up' you can ignore it."
-    echo
-    exit 1
+    echo "Attempting to install missing packages..."
+    export DEBIAN_FRONTEND=noninteractive
+    if ! apt-get update; then
+        echo "Error: Failed to update package lists via apt-get."
+        exit 1
+    fi
+    if ! apt-get install -y "${MISSING_PACKAGES[@]}"; then
+        echo "Error: Failed to install required packages: ${MISSING_PACKAGES[*]}"
+        echo "If you get an error from dnsmasq saying 'Failed to start up' you can ignore it."
+        exit 1
+    fi
+    echo "Successfully installed required packages."
 else
-    echo "All required packages are installed."
+    echo "All required packages are already installed."
 fi
 echo
 

@@ -1,0 +1,13 @@
+batctl
+iw
+wireless-tools
+network-manager
+net-tools
+bridge-utils
+iptables
+dnsmasq
+hostapd
+arping
+arp-scan
+bc
+
