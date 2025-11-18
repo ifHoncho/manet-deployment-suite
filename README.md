@@ -144,6 +144,10 @@ ETH_LAN=eth1              # Ethernet LAN interface
 # Additional IP Configuration
 WAP_IP=10.10.0.1          # IP for wireless access point interface
 ETH_LAN_IP=10.10.0.2      # IP for ethernet LAN interface
+LAN_MODE=bridge           # Default: bridge Wi-Fi/Ethernet together automatically
+LAN_BRIDGE=br-lan         # Bridge name when LAN_MODE=bridge
+LAN_IP=10.10.0.1          # Bridge IP (defaults to WAP_IP if unset)
+LAN_NETMASK=24            # CIDR netmask for LAN interfaces/bridge
 
 # Performance Tuning
 MESH_MTU=1500             # MTU size for mesh interface
@@ -153,6 +157,16 @@ BATMAN_ROUTING_ALGORITHM=BATMAN_V  # BATMAN_IV or BATMAN_V Note that BATMAN_V is
 ```
 
 If you leave `WAP_PASSWORD` blank (or shorter than 8 characters), the service generates a strong random password automatically. The current value is written to `/var/lib/mesh-network/generated-wap-password`, which is readable only by root.
+
+#### LAN Bridge Mode
+
+`LAN_MODE` defaults to `bridge`, so the Wi‑Fi access point (`WAP_IFACE`) and wired LAN (`ETH_LAN`) share the same subnet automatically. The script:
+
+- Creates `LAN_BRIDGE` (defaults to `br-lan`) and assigns it `LAN_IP/LAN_NETMASK` (falling back to `WAP_IP` and `MESH_NETMASK` when unset).
+- Attaches available Ethernet LAN interfaces to the bridge and instructs hostapd to bridge the AP interface automatically.
+- Configures dnsmasq, firewall, and NAT rules against the bridge so Wi‑Fi and wired clients share one DHCP pool and default gateway.
+
+Missing interfaces are handled gracefully. If only one of `WAP_IFACE` or `ETH_LAN` is present, the bridge is built with whichever interface exists (or it degenerates to a single interface), and dnsmasq/NAT bind only to devices that are actually online. For legacy dual-subnet behavior, set `LAN_MODE=dual`.
 
 ### Hardware Interface Management
 
@@ -172,7 +186,7 @@ Name=wlan0
 For optimal performance, consider:
 1. Each node should have a unique IP address (e.g., follow pattern 10.0.0.x for nodes (depending on netmask))
 2. Creating an `/etc/bat-hosts` file with numerical hostnames for easy reference
-3. Access point and LAN networks can use separate subnets (e.g., 10.x0.0.x)
+3. Access point and LAN networks can use separate subnets (e.g., 10.x0.0.x) or set `LAN_MODE=bridge` when you prefer them to share one subnet/gateway
 
 ## Service Operation
 

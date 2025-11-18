@@ -87,20 +87,8 @@ echo "Disabling dnsmasq and hostapd from starting automatically..."
 systemctl disable dnsmasq.service > /dev/null 2>&1
 systemctl disable hostapd.service > /dev/null 2>&1
 
-# Disable systemd-resolved
-echo "Disabling systemd-resolved..."
-systemctl stop systemd-resolved
-systemctl disable systemd-resolved
-
-# Enter custom DNS settings
-echo "Entering custom DNS settings..."
-rm /etc/resolv.conf
-echo "nameserver 127.0.0.1" > /etc/resolv.conf
-echo "nameserver 9.9.9.9" >> /etc/resolv.conf
-
-# Add hostname to /etc/hosts
-echo "Adding hostname to /etc/hosts..."
-sed -i "2s/.*/127.0.1.1 $(hostname)/" /etc/hosts
+# Leave systemd-resolved and host resolver configuration untouched so the host retains working DNS until the mesh service is running.
+echo "Leaving systemd-resolved enabled; mesh dnsmasq will still bind to loopback when the service runs."
 
 # Create mesh-network directory
 mkdir -p /etc/mesh-network

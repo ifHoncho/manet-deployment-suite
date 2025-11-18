@@ -83,6 +83,21 @@ last_known_mesh_gateway=""
 primary_route_configured=false
 fallback_route_configured=false
 
+# LAN/LAN-bridge configuration defaults
+LAN_MODE="${LAN_MODE:-bridge}"
+LAN_MODE="$(echo "${LAN_MODE}" | tr '[:upper:]' '[:lower:]')"
+LAN_BRIDGE="${LAN_BRIDGE:-br-lan}"
+LAN_IP="${LAN_IP:-${WAP_IP:-${ETH_LAN_IP}}}"
+LAN_NETMASK="${LAN_NETMASK:-${MESH_NETMASK:-24}}"
+LAN_BRIDGE_ACTIVE=false
+EFFECTIVE_ETH_LAN_IP="${ETH_LAN_IP:-}"
+
+declare -a ACTIVE_LAN_INTERFACES=()
+declare -A LAN_INTERFACE_IP_MAP=()
+
+MESH_FORWARD_CHAIN="MESH-NETWORK-FWD"
+MESH_NAT_CHAIN="MESH-NETWORK-NAT"
+
 # Script is always run as a managed service
 
 
@@ -303,29 +318,36 @@ add_iptables_rule() {
 setup_nat_for_mode() {
     local mode="$1"
     local wan_interface="$2"
-    
-    # Flush existing NAT rules
-    iptables -t nat -F POSTROUTING
+
+    initialize_firewall_chains
+    iptables -F "${MESH_FORWARD_CHAIN}" 2>/dev/null || true
+    iptables -t nat -F "${MESH_NAT_CHAIN}" 2>/dev/null || true
+    add_iptables_rule "filter" "${MESH_FORWARD_CHAIN}" "-m state --state RELATED,ESTABLISHED -j ACCEPT"
     
     if [ "$mode" = "server" ] && [ -n "$wan_interface" ]; then
         # Server mode - NAT from mesh to WAN
-        add_iptables_rule "nat" "POSTROUTING" "-o $wan_interface -j MASQUERADE"
+        add_iptables_rule "nat" "${MESH_NAT_CHAIN}" "-o $wan_interface -j MASQUERADE"
         
         # Allow forwarding from bat0 to WAN
-        add_iptables_rule "filter" "FORWARD" "-i bat0 -o $wan_interface -j ACCEPT"
-        add_iptables_rule "filter" "FORWARD" "-i $wan_interface -o bat0 -m state --state RELATED,ESTABLISHED -j ACCEPT"
+        add_iptables_rule "filter" "${MESH_FORWARD_CHAIN}" "-i bat0 -o $wan_interface -j ACCEPT"
+        add_iptables_rule "filter" "${MESH_FORWARD_CHAIN}" "-i $wan_interface -o bat0 -m state --state RELATED,ESTABLISHED -j ACCEPT"
         
         # Set up rules for LAN interfaces
-        for lan_iface in "${VALID_AP}" "${VALID_ETH_LAN}"; do
+        for lan_iface in "${ACTIVE_LAN_INTERFACES[@]}"; do
             if [ -n "${lan_iface}" ]; then
-                add_iptables_rule "filter" "FORWARD" "-i ${lan_iface} -o $wan_interface -j ACCEPT"
-                add_iptables_rule "filter" "FORWARD" "-i $wan_interface -o ${lan_iface} -m state --state RELATED,ESTABLISHED -j ACCEPT"
+                add_iptables_rule "filter" "${MESH_FORWARD_CHAIN}" "-i ${lan_iface} -o $wan_interface -j ACCEPT"
+                add_iptables_rule "filter" "${MESH_FORWARD_CHAIN}" "-i $wan_interface -o ${lan_iface} -m state --state RELATED,ESTABLISHED -j ACCEPT"
+                add_iptables_rule "filter" "${MESH_FORWARD_CHAIN}" "-i ${lan_iface} -o bat0 -j ACCEPT"
+                add_iptables_rule "filter" "${MESH_FORWARD_CHAIN}" "-i bat0 -o ${lan_iface} -j ACCEPT"
                 
                 # Get LAN IP and subnet
-                local lan_ip=$(ip -4 addr show dev "${lan_iface}" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1)
+                local lan_ip="${LAN_INTERFACE_IP_MAP[$lan_iface]:-}"
+                if [ -z "${lan_ip}" ]; then
+                    lan_ip=$(ip -4 addr show dev "${lan_iface}" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1)
+                fi
                 if [ -n "${lan_ip}" ]; then
                     # Add NAT for LAN traffic
-                    add_iptables_rule "nat" "POSTROUTING" "-s $(echo "${lan_ip}" | cut -d. -f1-3).0/24 -o $wan_interface -j MASQUERADE"
+                    add_iptables_rule "nat" "${MESH_NAT_CHAIN}" "-s $(echo "${lan_ip}" | cut -d. -f1-3).0/24 -o $wan_interface -j MASQUERADE"
                     log_debug "Enabled NAT for ${lan_iface} subnet $(echo "${lan_ip}" | cut -d. -f1-3).0/24"
                 fi
             fi
@@ -334,19 +356,22 @@ setup_nat_for_mode() {
         log_info "Configured NAT and forwarding for server mode via $wan_interface"
     else
         # Client mode - NAT from LAN to mesh
-        add_iptables_rule "nat" "POSTROUTING" "-o bat0 -j MASQUERADE"
+        add_iptables_rule "nat" "${MESH_NAT_CHAIN}" "-o bat0 -j MASQUERADE"
         
         # Set up rules for LAN interfaces
-        for lan_iface in "${VALID_AP}" "${VALID_ETH_LAN}"; do
+        for lan_iface in "${ACTIVE_LAN_INTERFACES[@]}"; do
             if [ -n "${lan_iface}" ]; then
-                add_iptables_rule "filter" "FORWARD" "-i ${lan_iface} -o bat0 -j ACCEPT"
-                add_iptables_rule "filter" "FORWARD" "-i bat0 -o ${lan_iface} -m state --state RELATED,ESTABLISHED -j ACCEPT"
+                add_iptables_rule "filter" "${MESH_FORWARD_CHAIN}" "-i ${lan_iface} -o bat0 -j ACCEPT"
+                add_iptables_rule "filter" "${MESH_FORWARD_CHAIN}" "-i bat0 -o ${lan_iface} -m state --state RELATED,ESTABLISHED -j ACCEPT"
                 
                 # Get LAN IP and subnet
-                local lan_ip=$(ip -4 addr show dev "${lan_iface}" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1)
+                local lan_ip="${LAN_INTERFACE_IP_MAP[$lan_iface]:-}"
+                if [ -z "${lan_ip}" ]; then
+                    lan_ip=$(ip -4 addr show dev "${lan_iface}" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1)
+                fi
                 if [ -n "${lan_ip}" ]; then
                     # Add NAT for LAN traffic
-                    add_iptables_rule "nat" "POSTROUTING" "-s $(echo "${lan_ip}" | cut -d. -f1-3).0/24 -o bat0 -j MASQUERADE"
+                    add_iptables_rule "nat" "${MESH_NAT_CHAIN}" "-s $(echo "${lan_ip}" | cut -d. -f1-3).0/24 -o bat0 -j MASQUERADE"
                     log_debug "Enabled NAT for ${lan_iface} subnet $(echo "${lan_ip}" | cut -d. -f1-3).0/24"
                 fi
             fi
@@ -606,29 +631,28 @@ TRANSLATION_TABLE_MAX_AGE=3600  # Maximum age of entries in seconds (1 hour)
 
 # Initialize translation table
 init_translation_table() {
-    # Create directory with sudo if it doesn't exist
-    if ! sudo mkdir -p "$(dirname "${TRANSLATION_TABLE_FILE}")"; then
+    # Create directory if it doesn't exist
+    if ! mkdir -p "$(dirname "${TRANSLATION_TABLE_FILE}")"; then
         log_error "Failed to create directory $(dirname "${TRANSLATION_TABLE_FILE}")"
         return 1
     fi
     
-    # Create file with sudo if it doesn't exist and set permissions
+    # Create file if it doesn't exist and set permissions
     if [ ! -f "${TRANSLATION_TABLE_FILE}" ]; then
-        if ! sudo touch "${TRANSLATION_TABLE_FILE}"; then
+        if ! touch "${TRANSLATION_TABLE_FILE}"; then
             log_error "Failed to create translation table file ${TRANSLATION_TABLE_FILE}"
             return 1
         fi
-        if ! sudo chmod 666 "${TRANSLATION_TABLE_FILE}"; then
+        if ! chmod 666 "${TRANSLATION_TABLE_FILE}"; then
              log_error "Failed to set permissions on translation table file ${TRANSLATION_TABLE_FILE}"
              return 1
         fi
     fi
     
-    # Verify we can write to the file (as the script user, may not be needed if always using sudo?)
-    # Re-evaluate if this check is necessary as sudo is used for modifications
+    # Verify we can write to the file
     if [ ! -w "${TRANSLATION_TABLE_FILE}" ]; then
         # Attempt to fix permissions again, just in case
-        sudo chmod 666 "${TRANSLATION_TABLE_FILE}" 2>/dev/null
+        chmod 666 "${TRANSLATION_TABLE_FILE}" 2>/dev/null
         if [ ! -w "${TRANSLATION_TABLE_FILE}" ]; then
             log_warn "Warning: Cannot write to translation table file ${TRANSLATION_TABLE_FILE}"
             # Consider if this should be a fatal error depending on script logic
@@ -673,15 +697,14 @@ clean_translation_table() {
         fi
     done < "${TRANSLATION_TABLE_FILE}"
     
-    # Use sudo mv to ensure permissions
-    if ! sudo mv "${temp_file}" "${TRANSLATION_TABLE_FILE}"; then
+    if ! mv "${temp_file}" "${TRANSLATION_TABLE_FILE}"; then
         log_error "Failed to move temporary file to ${TRANSLATION_TABLE_FILE}"
         rm -f "${temp_file}" # Clean up temp file on failure
         return 1
     fi
     
     # Ensure permissions are correct after move
-    sudo chmod 666 "${TRANSLATION_TABLE_FILE}" 2>/dev/null || log_warn "Could not set final permissions on translation table."
+    chmod 666 "${TRANSLATION_TABLE_FILE}" 2>/dev/null || log_warn "Could not set final permissions on translation table."
     
     log_debug "Translation table cleaned successfully."
     return 0
@@ -880,7 +903,7 @@ detect_gateway_ip() {
         # First try a quick scan of likely addresses (first 20 IPs)
         log_debug "Performing quick scan of likely IPs first" >&2
         local quick_scan_output
-        quick_scan_output=$(sudo arp-scan --interface=bat0 --retry=1 --timeout=500 "${network_addr%.*}.1-20" 2>/dev/null)
+        quick_scan_output=$(arp-scan --interface=bat0 --retry=1 --timeout=500 "${network_addr%.*}.1-20" 2>/dev/null)
         
         # Extract IPs and MACs from quick scan output
         local quick_mesh_nodes
@@ -892,7 +915,7 @@ detect_gateway_ip() {
         else
             log_debug "No nodes found in quick scan, performing full scan" >&2
             local scan_output
-            scan_output=$(sudo arp-scan --interface=bat0 --retry=1 "${network_addr}/${MESH_NETMASK}" 2>/dev/null)
+            scan_output=$(arp-scan --interface=bat0 --retry=1 "${network_addr}/${MESH_NETMASK}" 2>/dev/null)
             
             if [ $? -ne 0 ]; then
                 log_error "arp-scan failed" >&2
@@ -1070,6 +1093,76 @@ get_valid_interfaces() {
     fi
 }
 
+# LAN interface tracking/helpers
+reset_lan_interface_tracking() {
+    ACTIVE_LAN_INTERFACES=()
+    LAN_INTERFACE_IP_MAP=()
+}
+
+register_lan_interface() {
+    local interface="$1"
+    [ -z "${interface}" ] && return
+
+    for existing in "${ACTIVE_LAN_INTERFACES[@]}"; do
+        if [ "${existing}" = "${interface}" ]; then
+            return
+        fi
+    done
+
+    ACTIVE_LAN_INTERFACES+=("${interface}")
+}
+
+disable_nm_for_interface() {
+    local interface="$1"
+    [ -z "${interface}" ] && return
+
+    if command -v nmcli >/dev/null 2>&1; then
+        log "Disabling NetworkManager for ${interface}"
+        nmcli device set "${interface}" managed no || log "Warning: Failed to disable NetworkManager for ${interface}"
+    fi
+}
+
+ensure_chain_jump() {
+    local table="$1"
+    local base_chain="$2"
+    local target_chain="$3"
+
+    if ! iptables -t "${table}" -C "${base_chain}" -j "${target_chain}" >/dev/null 2>&1; then
+        iptables -t "${table}" -I "${base_chain}" 1 -j "${target_chain}"
+    fi
+}
+
+initialize_firewall_chains() {
+    if ! iptables -nL "${MESH_FORWARD_CHAIN}" >/dev/null 2>&1; then
+        iptables -N "${MESH_FORWARD_CHAIN}"
+    fi
+    ensure_chain_jump "filter" "FORWARD" "${MESH_FORWARD_CHAIN}"
+
+    if ! iptables -t nat -nL "${MESH_NAT_CHAIN}" >/dev/null 2>&1; then
+        iptables -t nat -N "${MESH_NAT_CHAIN}"
+    fi
+    ensure_chain_jump "nat" "POSTROUTING" "${MESH_NAT_CHAIN}"
+}
+
+cidr_to_netmask() {
+    local cidr="$1"
+    local full_octets=$((cidr / 8))
+    local partial_bits=$((cidr % 8))
+    local netmask=()
+
+    for i in {0..3}; do
+        if [ "${i}" -lt "${full_octets}" ]; then
+            netmask[i]=255
+        elif [ "${i}" -eq "${full_octets}" ] && [ "${partial_bits}" -ne 0 ]; then
+            netmask[i]=$((256 - 2 ** (8 - partial_bits)))
+        else
+            netmask[i]=0
+        fi
+    done
+
+    printf "%s.%s.%s.%s" "${netmask[0]}" "${netmask[1]}" "${netmask[2]}" "${netmask[3]}"
+}
+
 # Configure LAN interfaces (shared function for AP and Ethernet LAN)
 setup_lan_interface() {
     local interface="$1"
@@ -1090,11 +1183,7 @@ setup_lan_interface() {
 
     log "Setting up ${interface_name} interface (${interface}) with IP ${ip_address}..."
 
-    # Disable NetworkManager for the AP interface
-    if command -v nmcli >/dev/null 2>&1; then
-        log "Disabling NetworkManager for ${interface}"
-        nmcli device set "${interface}" managed no || log "Warning: Failed to disable NetworkManager for ${interface}"
-    fi
+    disable_nm_for_interface "${interface}"
     
     # Check if IP is defined
     if [ -z "${ip_address}" ]; then
@@ -1107,8 +1196,8 @@ setup_lan_interface() {
     ip addr flush dev "${interface}" 2>/dev/null || true
     
     # Set the IP address
-    if ! ip addr add "${ip_address}/${MESH_NETMASK}" dev "${interface}"; then
-        log "Error: Failed to set IP address ${ip_address}/${MESH_NETMASK} on ${interface}"
+    if ! ip addr add "${ip_address}/${LAN_NETMASK}" dev "${interface}"; then
+        log "Error: Failed to set IP address ${ip_address}/${LAN_NETMASK} on ${interface}"
         return 1
     fi
     
@@ -1119,15 +1208,131 @@ setup_lan_interface() {
         return 1
     fi
     
+    register_lan_interface "${interface}"
+    LAN_INTERFACE_IP_MAP["${interface}"]="${ip_address}"
+
     log "${interface_name} interface ${interface} setup complete with IP ${ip_address}"
     return 0
 }
 
+attach_interface_to_bridge() {
+    local interface="$1"
+    local interface_name="$2"
+
+    if [ -z "${interface}" ]; then
+        log "${interface_name} interface is not defined, skipping bridge attachment"
+        return 0
+    fi
+
+    if ! ip link show "${interface}" >/dev/null 2>&1; then
+        log "${interface_name} interface ${interface} does not exist, skipping bridge attachment"
+        return 0
+    fi
+
+    disable_nm_for_interface "${interface}"
+
+    log "Attaching ${interface_name} interface (${interface}) to bridge ${LAN_BRIDGE}"
+    ip link set "${interface}" down 2>/dev/null || true
+    ip addr flush dev "${interface}" 2>/dev/null || true
+    if ! ip link set "${interface}" master "${LAN_BRIDGE}"; then
+        log_error "Failed to attach ${interface} to bridge ${LAN_BRIDGE}"
+        return 1
+    fi
+    ip link set "${interface}" up 2>/dev/null || true
+
+    return 0
+}
+
+setup_bridge_if_needed() {
+    LAN_BRIDGE_ACTIVE=false
+
+    if [ "${LAN_MODE}" != "bridge" ]; then
+        return 0
+    fi
+
+    if [ -z "${LAN_IP}" ]; then
+        log_warn "LAN_MODE=bridge but LAN_IP is not defined; skipping bridge setup"
+        return 1
+    fi
+
+    if [ -z "${VALID_AP}" ] && [ -z "${VALID_ETH_LAN}" ]; then
+        log_warn "Bridge mode requested but no LAN interfaces detected; skipping bridge setup"
+        return 1
+    fi
+
+    log_info "Configuring bridge ${LAN_BRIDGE} for unified LAN subnet"
+
+    if ! ip link show "${LAN_BRIDGE}" >/dev/null 2>&1; then
+        if ! ip link add name "${LAN_BRIDGE}" type bridge; then
+            log_error "Failed to create bridge interface ${LAN_BRIDGE}"
+            return 1
+        fi
+    fi
+
+    disable_nm_for_interface "${LAN_BRIDGE}"
+
+    ip link set "${LAN_BRIDGE}" down 2>/dev/null || true
+    ip addr flush dev "${LAN_BRIDGE}" 2>/dev/null || true
+
+    # Attach wired LAN interface(s); hostapd will attach the AP when it starts
+    attach_interface_to_bridge "${VALID_ETH_LAN}" "Ethernet LAN" || return 1
+
+    if ! ip addr add "${LAN_IP}/${LAN_NETMASK}" dev "${LAN_BRIDGE}"; then
+        log_error "Failed to set IP address ${LAN_IP}/${LAN_NETMASK} on ${LAN_BRIDGE}"
+        return 1
+    fi
+
+    if ! ip link set "${LAN_BRIDGE}" up; then
+        log_error "Failed to bring bridge ${LAN_BRIDGE} up"
+        return 1
+    fi
+
+    register_lan_interface "${LAN_BRIDGE}"
+    LAN_INTERFACE_IP_MAP["${LAN_BRIDGE}"]="${LAN_IP}"
+    LAN_BRIDGE_ACTIVE=true
+
+    log_info "Bridge ${LAN_BRIDGE} ready with IP ${LAN_IP}/${LAN_NETMASK}"
+    return 0
+}
+
+configure_lan_interfaces() {
+    reset_lan_interface_tracking
+    EFFECTIVE_ETH_LAN_IP="${ETH_LAN_IP:-}"
+
+    if ! setup_bridge_if_needed && [ "${LAN_MODE}" = "bridge" ]; then
+        log_warn "Bridge mode requested but could not be configured; falling back to standalone LAN configuration"
+    fi
+
+    if [ "${LAN_BRIDGE_ACTIVE}" = "true" ]; then
+        if [ -n "${VALID_AP}" ]; then
+            setup_ap_interface || log "Warning: AP interface setup failed"
+        else
+            log_info "Bridge mode active but no AP interface detected"
+        fi
+        return 0
+    fi
+
+    log "Setting up Ethernet LAN interface..."
+    setup_eth_lan_interface || log "Warning: Ethernet LAN interface setup failed"
+
+    log "Setting up Access Point interface"
+    setup_ap_interface || log "Warning: AP interface setup failed"
+}
+
+
 # Function to set up the AP interface
 setup_ap_interface() {
-    # Setup the AP interface
-    if ! setup_lan_interface "${WAP_IFACE}" "${WAP_IP}" "AP"; then
-        return 1
+    if [ -z "${VALID_AP}" ]; then
+        log "AP interface is not available, skipping setup"
+        return 0
+    fi
+
+    if [ "${LAN_BRIDGE_ACTIVE}" = "true" ]; then
+        log "Bridge mode active; skipping standalone IP configuration for AP interface ${VALID_AP}"
+    else
+        if ! setup_lan_interface "${VALID_AP}" "${WAP_IP}" "AP"; then
+            return 1
+        fi
     fi
     
     # If AP interface setup was successful, set up hostapd
@@ -1144,6 +1349,16 @@ setup_ap_interface() {
 setup_eth_lan_interface() {
     local eth_lan_ip=""
     
+    if [ "${LAN_BRIDGE_ACTIVE}" = "true" ]; then
+        log "Bridge mode active; Ethernet LAN interface managed by ${LAN_BRIDGE}"
+        return 0
+    fi
+
+    if [ -z "${VALID_ETH_LAN}" ]; then
+        log "Ethernet LAN interface is not available, skipping setup"
+        return 0
+    fi
+
     # Check if ETH_LAN_IP is defined, if not use the same subnet as WAP_IP but with .2
     if [ -n "${ETH_LAN_IP}" ]; then
         eth_lan_ip="${ETH_LAN_IP}"
@@ -1156,8 +1371,10 @@ setup_eth_lan_interface() {
         return 0
     fi
     
+    EFFECTIVE_ETH_LAN_IP="${eth_lan_ip}"
+
     # Setup the Ethernet LAN interface
-    setup_lan_interface "${ETH_LAN}" "${eth_lan_ip}" "Ethernet LAN"
+    setup_lan_interface "${VALID_ETH_LAN}" "${eth_lan_ip}" "Ethernet LAN"
 }
 
 # Function to set up dnsmasq for DHCP and DNS
@@ -1186,7 +1403,7 @@ setup_dnsmasq() {
         if ! ls /etc/dnsmasq.conf.bak.* >/dev/null 2>&1; then
             local backup_file="/etc/dnsmasq.conf.bak.$(date +%Y%m%d%H%M%S)"
             log "Backing up original dnsmasq.conf to ${backup_file}"
-            sudo cp "/etc/dnsmasq.conf" "${backup_file}" || {
+            cp "/etc/dnsmasq.conf" "${backup_file}" || {
                 log "Error: Failed to backup dnsmasq.conf"
                 return 1
             }
@@ -1206,22 +1423,26 @@ setup_dnsmasq() {
 bind-interfaces
 EOF
 
+    echo "# Loopback interface for local DNS clients" >> "${tmp_conf}"
+    echo "interface=lo" >> "${tmp_conf}"
+    echo "listen-address=127.0.0.1" >> "${tmp_conf}"
+    echo "" >> "${tmp_conf}"
+
     # Add interfaces to listen on
-    if [ -n "${VALID_AP}" ] && [ -n "${WAP_IP}" ]; then
-        local wap_subnet=$(echo "${WAP_IP}" | cut -d. -f1-3)
-        echo "# AP Interface" >> "${tmp_conf}"
-        echo "interface=${VALID_AP}" >> "${tmp_conf}"
-        echo "dhcp-range=${wap_subnet}.50,${wap_subnet}.200,255.255.255.0,12h" >> "${tmp_conf}"
+    for lan_iface in "${ACTIVE_LAN_INTERFACES[@]}"; do
+        local iface_ip="${LAN_INTERFACE_IP_MAP[$lan_iface]:-}"
+        if [ -z "${iface_ip}" ]; then
+            log "Skipping dnsmasq range for ${lan_iface}; no IP address assigned"
+            continue
+        fi
+
+        local iface_subnet=$(echo "${iface_ip}" | cut -d. -f1-3)
+        echo "# ${lan_iface} Interface" >> "${tmp_conf}"
+        echo "interface=${lan_iface}" >> "${tmp_conf}"
+        echo "dhcp-range=${iface_subnet}.50,${iface_subnet}.200,255.255.255.0,12h" >> "${tmp_conf}"
+        echo "dhcp-option=interface:${lan_iface},option:router,${iface_ip}" >> "${tmp_conf}"
         echo "" >> "${tmp_conf}"
-    fi
-    
-    if [ -n "${VALID_ETH_LAN}" ] && [ -n "${ETH_LAN_IP}" ]; then
-        local eth_subnet=$(echo "${ETH_LAN_IP}" | cut -d. -f1-3)
-        echo "# Ethernet LAN Interface" >> "${tmp_conf}"
-        echo "interface=${VALID_ETH_LAN}" >> "${tmp_conf}"
-        echo "dhcp-range=${eth_subnet}.50,${eth_subnet}.200,255.255.255.0,12h" >> "${tmp_conf}"
-        echo "" >> "${tmp_conf}"
-    fi
+    done
     
     # Add exceptions for WAN interfaces
     if [ -n "${VALID_WAN}" ]; then
@@ -1251,12 +1472,11 @@ domain=mesh.local
 local=/mesh.local/
 
 # DHCP options
-dhcp-option=option:router,${NODE_IP}
 dhcp-authoritative
 EOF
     
     # Install the new configuration
-    sudo cp "${tmp_conf}" "/etc/dnsmasq.conf" || {
+    cp "${tmp_conf}" "/etc/dnsmasq.conf" || {
         log "Error: Failed to install new dnsmasq.conf"
         rm -f "${tmp_conf}"
         return 1
@@ -1323,7 +1543,7 @@ setup_hostapd() {
         if ! ls /etc/hostapd/hostapd.conf.bak.* >/dev/null 2>&1; then
             local backup_file="/etc/hostapd/hostapd.conf.bak.$(date +%Y%m%d%H%M%S)"
             log "Backing up original hostapd.conf to ${backup_file}"
-            sudo cp "/etc/hostapd/hostapd.conf" "${backup_file}" || {
+            cp "/etc/hostapd/hostapd.conf" "${backup_file}" || {
                 log "Error: Failed to backup hostapd.conf"
                 return 1
             }
@@ -1342,6 +1562,13 @@ setup_hostapd() {
 # Interface configuration
 interface=${VALID_AP}
 driver=nl80211
+EOF
+
+    if [ "${LAN_BRIDGE_ACTIVE}" = "true" ]; then
+        echo "bridge=${LAN_BRIDGE}" >> "${tmp_conf}"
+    fi
+
+    cat >> "${tmp_conf}" << EOF
 
 # SSID configuration
 ssid=${WAP_SSID}
@@ -1364,14 +1591,14 @@ ignore_broadcast_ssid=0
 EOF
     
     # Create hostapd directory if it doesn't exist
-    sudo mkdir -p "/etc/hostapd" 2>/dev/null || {
+    mkdir -p "/etc/hostapd" 2>/dev/null || {
         log "Error: Failed to create hostapd directory"
         rm -f "${tmp_conf}"
         return 1
     }
     
     # Install the new configuration
-    sudo cp "${tmp_conf}" "/etc/hostapd/hostapd.conf" || {
+    cp "${tmp_conf}" "/etc/hostapd/hostapd.conf" || {
         log "Error: Failed to install new hostapd.conf"
         rm -f "${tmp_conf}"
         return 1
@@ -1396,96 +1623,21 @@ EOF
 setup_firewall() {
     log_info "Setting up firewall rules..."
     
-    # Clean up existing firewall rules
-    iptables -F || { log_error "Failed to flush iptables rules"; return 1; }
-    iptables -t nat -F || { log_error "Failed to flush NAT rules"; return 1; }
-    iptables -t mangle -F || { log_error "Failed to flush mangle rules"; return 1; }
-    
-    log_debug "Setting default policies"
-    iptables -P INPUT ACCEPT || { log_error "Failed to set INPUT policy"; return 1; }
-    iptables -P FORWARD ACCEPT || { log_error "Failed to set FORWARD policy"; return 1; }
-    iptables -P OUTPUT ACCEPT || { log_error "Failed to set OUTPUT policy"; return 1; }
-    
-    # Configure NAT and routing for server mode
-    # Address this/ pin in this
-    # When this gets called, the gw mode is set to 'auto' (note. 'auto' is only a logical config option, the actual batman interface is configured to 'client' by default) (gets defined later then dynamically implemented with different functions).
-    # It would be better if this is the only function that exists in that regard, then it gets called with an arguement to configure for either client or server depending on WAN connectivity status
+    initialize_firewall_chains
+    add_iptables_rule "filter" "INPUT" "-m state --state ESTABLISHED,RELATED -j ACCEPT"
     if [ "${BATMAN_GW_MODE}" = "server" ] && [ -n "${VALID_WAN}" ]; then
         log_info "Setting up NAT and routing for server mode"
-        
-        # Allow established connections
-        iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-        iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
-        
-        # Allow forwarding between interfaces
-        iptables -A FORWARD -i bat0 -o "${VALID_WAN}" -j ACCEPT
-        iptables -A FORWARD -o bat0 -j ACCEPT
-        iptables -A FORWARD -i "${VALID_WAN}" -j ACCEPT
-        iptables -A FORWARD -o "${VALID_WAN}" -j ACCEPT
-        
-        # NAT configuration for internet access
-        # Masquerade all traffic going out WAN
-        iptables -t nat -A POSTROUTING -o "${VALID_WAN}" -j MASQUERADE
-        
-        # Make sure we accept forwarded packets
-        iptables -A FORWARD -i bat0 -o "${VALID_WAN}" -j ACCEPT
-        iptables -A FORWARD -i "${VALID_WAN}" -o bat0 -m state --state RELATED,ESTABLISHED -j ACCEPT
-        
-        # Set up rules for both LAN interfaces using a common pattern
-        for lan_iface in "${VALID_AP}" "${VALID_ETH_LAN}"; do
-            if [ -n "${lan_iface}" ]; then
-                log_debug "Setting up forwarding for interface: ${lan_iface}"
-                # Allow forwarding between LAN interface and mesh/WAN
-                iptables -A FORWARD -i "${lan_iface}" -j ACCEPT
-                iptables -A FORWARD -o "${lan_iface}" -j ACCEPT
-                # Add specific rules for LAN to WAN
-                iptables -A FORWARD -i "${lan_iface}" -o "${VALID_WAN}" -j ACCEPT
-                iptables -A FORWARD -i "${VALID_WAN}" -o "${lan_iface}" -m state --state RELATED,ESTABLISHED -j ACCEPT
-            fi
-        done
+        setup_nat_for_mode "server" "${VALID_WAN}"
     else
         # Client mode or no WAN interface
         log_info "Setting up client mode routing and forwarding"
-        iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-        iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
-        
-        # Allow forwarding between bat0 and all interfaces
-        iptables -A FORWARD -i bat0 -j ACCEPT
-        iptables -A FORWARD -o bat0 -j ACCEPT
-        
-        # Set up rules for both LAN interfaces using a common pattern
-        for lan_iface in "${VALID_AP}" "${VALID_ETH_LAN}"; do
-            if [ -n "${lan_iface}" ]; then
-                log_debug "Setting up forwarding for interface: ${lan_iface}"
-                # Allow forwarding between LAN and mesh
-                iptables -A FORWARD -i "${lan_iface}" -j ACCEPT
-                iptables -A FORWARD -o "${lan_iface}" -j ACCEPT
-                
-                # Determine the subnet based on the interface
-                local subnet=""
-                if [ "${lan_iface}" = "${VALID_AP}" ] && [ -n "${WAP_IP}" ]; then
-                    subnet="-s $(echo "${WAP_IP}" | cut -d. -f1-3).0/24"
-                elif [ "${lan_iface}" = "${VALID_ETH_LAN}" ] && [ -n "${ETH_LAN_IP}" ]; then
-                    subnet="-s $(echo "${ETH_LAN_IP}" | cut -d. -f1-3).0/24"
-                fi
-                
-                # NAT all traffic from LAN to mesh
-                if [ -n "${subnet}" ]; then
-                    log_debug "Setting up NAT for subnet ${subnet} from ${lan_iface} to bat0"
-                    iptables -t nat -A POSTROUTING -o bat0 ${subnet} -j MASQUERADE
-                else
-                    # Fallback if no subnet info available
-                    log_debug "Setting up NAT for all traffic from ${lan_iface} to bat0"
-                    iptables -t nat -A POSTROUTING -o bat0 -j MASQUERADE
-                fi
-            fi
-        done
+        setup_nat_for_mode "client" ""
     fi
     
     log_debug "Setting up logging rules"
     # Security logging
-    iptables -A INPUT -m limit --limit 5/min -j LOG --log-prefix "iptables_INPUT_denied: " --log-level 7
-    iptables -A FORWARD -m limit --limit 5/min -j LOG --log-prefix "iptables_FORWARD_denied: " --log-level 7
+    add_iptables_rule "filter" "INPUT" "-m limit --limit 5/min -j LOG --log-prefix \"iptables_INPUT_denied: \" --log-level 7"
+    add_iptables_rule "filter" "FORWARD" "-m limit --limit 5/min -j LOG --log-prefix \"iptables_FORWARD_denied: \" --log-level 7"
     
     return 0
 }
@@ -2009,24 +2161,9 @@ monitor_mesh_network() {
         if [ "${current_mode}" = "server" ]; then
             # In server mode, verify NAT and forwarding are working
             if [ "${wan_available}" = "true" ]; then
-                if ! iptables -t nat -L POSTROUTING -v 2>/dev/null | grep -q "${active_wan}"; then
+                if ! iptables -t nat -S "${MESH_NAT_CHAIN}" 2>/dev/null | grep -q "${active_wan}"; then
                     log_warn "NAT rules missing or outdated, reconfiguring..."
-                    
-                    # Flush existing NAT rules and set up new ones
-                    iptables -t nat -F POSTROUTING
-                    iptables -t nat -A POSTROUTING -o "${active_wan}" -j MASQUERADE
-                    
-                    # Ensure forwarding is enabled
-                    iptables -A FORWARD -i bat0 -o "${active_wan}" -j ACCEPT
-                    iptables -A FORWARD -i "${active_wan}" -o bat0 -m state --state RELATED,ESTABLISHED -j ACCEPT
-                    
-                    # Make sure LAN interfaces can also access the internet
-                    for lan_iface in "${VALID_AP}" "${VALID_ETH_LAN}"; do
-                        if [ -n "${lan_iface}" ]; then
-                            iptables -A FORWARD -i "${lan_iface}" -o "${active_wan}" -j ACCEPT
-                            iptables -A FORWARD -i "${active_wan}" -o "${lan_iface}" -m state --state RELATED,ESTABLISHED -j ACCEPT
-                        fi
-                    done
+                    setup_nat_for_mode "server" "${active_wan}"
                 fi
             else
                 # Server mode but WAN is down - force transition to client mode immediately
@@ -2528,24 +2665,6 @@ update_route_status() {
 # Setup Interfaces and Services
 #######################################
 
-setup_interfaces_and_services() {
-    # Setup Ethernet LAN interface
-    log "Setting up Ethernet LAN interface..."
-    setup_eth_lan_interface || log "Warning: Ethernet LAN interface setup failed"
-
-    # Setup AP interface
-    log "Setting up Access Point interface"
-    setup_ap_interface || log "Warning: AP interface setup failed"
-
-    # Setup dnsmasq for DHCP and DNS (important that this is done last or it will fail to start)
-    log "Setting up dnsmasq configuration..."
-    setup_dnsmasq || log "Warning: dnsmasq setup failed"
-}
-
-#######################################
-# MAIN SCRIPT EXECUTION
-#######################################
-
 # Main setup function
 setup_mesh_network() {
     # Validate configuration
@@ -2580,6 +2699,9 @@ setup_mesh_network() {
         log_debug "No Ethernet LAN interface available"
     fi
 
+    log_info "==== CONFIGURING LAN INTERFACES ===="
+    configure_lan_interfaces
+
     # Configure routing and firewall
     log_info "Configuring routing and firewall rules"
     
@@ -2596,11 +2718,9 @@ setup_mesh_network() {
     # Setup initial routing
     setup_initial_routing || { log_error "Failed to configure initial routing"; exit 1; }
     
-    # Log successful setup
-    log_info "==== SETTING UP ADDITIONAL NETWORK INTERFACES ===="
-    
-    # Setup additional network interfaces and services
-    setup_interfaces_and_services
+    # Setup DHCP/DNS services after interfaces are ready
+    log "Setting up dnsmasq configuration..."
+    setup_dnsmasq || log "Warning: dnsmasq setup failed"
     
     # Log successful completion
     log_info "==== MESH NETWORK SETUP COMPLETE ===="
