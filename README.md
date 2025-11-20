@@ -153,7 +153,7 @@ LAN_NETMASK=24            # CIDR netmask for LAN interfaces/bridge
 MESH_MTU=1500             # MTU size for mesh interface
 BATMAN_ORIG_INTERVAL=1000 # Originator interval (ms)
 BATMAN_HOP_PENALTY=30     # Hop penalty
-BATMAN_ROUTING_ALGORITHM=BATMAN_V  # BATMAN_IV or BATMAN_V Note that BATMAN_V is only supported in newer versions of batctl
+BATMAN_ROUTING_ALGORITHM=BATMAN_IV  # BATMAN_IV or BATMAN_V Note that BATMAN_V is only supported in newer versions of batctl
 ```
 
 If you leave `WAP_PASSWORD` blank (or shorter than 8 characters), the service generates a strong random password automatically. The current value is written to `/var/lib/mesh-network/generated-wap-password`, which is readable only by root.
