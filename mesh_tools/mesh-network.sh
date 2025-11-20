@@ -77,6 +77,36 @@ setup_logging() {
 # ERROR: Error conditions that affect functionality
 LOG_LEVEL=1
 
+# Shared log throttling and monitoring intervals. These globals allow us
+# to keep the log readable even when probes are noisy and to track where
+# the monitoring loop spends its time.
+MONITOR_LOOP_INTERVAL="${MONITOR_LOOP_INTERVAL:-5}"
+FAST_MONITOR_LOOP_INTERVAL="${FAST_MONITOR_LOOP_INTERVAL:-2}"
+declare -A LOG_LAST_EVENT_TIME
+declare -A MONITOR_PHASE_DURATION
+
+# Adaptive gateway watchdog thresholds. We fall back to the "fast" values
+# whenever we're already operating without WAN so that a dead mesh gateway
+# is removed within one or two monitor cycles.
+FAST_GATEWAY_FAIL_COUNT=2
+FAST_GATEWAY_FAIL_WINDOW=6
+DEFAULT_GATEWAY_FAIL_COUNT=3
+DEFAULT_GATEWAY_FAIL_WINDOW=15
+
+# Internet reachability probe cache. When WAN is already unavailable we
+# reuse the last result for up to this many seconds instead of re-running
+# the heavy multi-endpoint probe every loop.
+GLOBAL_PROBE_LAST_RESULT=false
+GLOBAL_PROBE_LAST_TS=0
+GLOBAL_PROBE_LAST_MODE="full"
+GLOBAL_PROBE_CACHE_TTL=30
+
+# Mesh scan cache so we don't run arp-scan every single gateway attempt.
+# detect_gateway_ip will refresh this data at most once per TTL.
+MESH_SCAN_CACHE_DATA=""
+MESH_SCAN_CACHE_TS=0
+MESH_SCAN_CACHE_TTL=60
+
 # Global routing state shared between monitor and helper functions
 current_gateway=""
 last_known_mesh_gateway=""
@@ -129,6 +159,196 @@ log() {
     local formatted="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
     echo "${formatted}"
     echo "${formatted}" >&2
+}
+
+format_duration() {
+    local seconds="$1"
+    
+    if [ -z "${seconds}" ] || [ "${seconds}" -lt 0 ]; then
+        echo "0s"
+        return
+    fi
+    
+    if [ "${seconds}" -lt 60 ]; then
+        echo "${seconds}s"
+        return
+    fi
+    
+    if [ "${seconds}" -lt 3600 ]; then
+        local minutes=$((seconds / 60))
+        local rem=$((seconds % 60))
+        printf "%dm%02ds" "${minutes}" "${rem}"
+        return
+    fi
+    
+    local hours=$((seconds / 3600))
+    local minutes=$(((seconds % 3600) / 60))
+    printf "%dh%02dm" "${hours}" "${minutes}"
+}
+
+format_timestamp_delta() {
+    local timestamp="$1"
+    local now="$2"
+    
+    if [ -z "${timestamp}" ] || [ "${timestamp}" -eq 0 ]; then
+        echo "never"
+        return
+    fi
+    
+    local delta=$((now - timestamp))
+    if [ "${delta}" -lt 0 ]; then
+        echo "just now"
+        return
+    fi
+    
+    printf "%s ago" "$(format_duration "${delta}")"
+}
+
+# Gateway discovery tracking lets us communicate *why* we keep looping
+# (e.g. no originators, gateway still unreachable) without flooding
+# the log. These counters reset once a replacement gateway is found.
+GATEWAY_DISCOVERY_ATTEMPTS=0
+GATEWAY_DISCOVERY_STALLED_SINCE=0
+GATEWAY_DISCOVERY_LAST_REASON=""
+
+record_gateway_discovery_failure() {
+    local reason="$1"
+    local now
+    now=$(date +%s)
+    
+    if [ "${GATEWAY_DISCOVERY_STALLED_SINCE}" -eq 0 ]; then
+        GATEWAY_DISCOVERY_STALLED_SINCE=$now
+        GATEWAY_DISCOVERY_ATTEMPTS=0
+    fi
+    
+    GATEWAY_DISCOVERY_ATTEMPTS=$((GATEWAY_DISCOVERY_ATTEMPTS + 1))
+    GATEWAY_DISCOVERY_LAST_REASON="$reason"
+    
+    if [ "${GATEWAY_DISCOVERY_ATTEMPTS}" -eq 1 ]; then
+        log_warn "Mesh gateway discovery failed: ${reason}"
+    fi
+    
+    local elapsed=$((now - GATEWAY_DISCOVERY_STALLED_SINCE))
+    log_rate_limited "info" "gateway_search_summary" 30 \
+        "Mesh gateway search ongoing (${GATEWAY_DISCOVERY_ATTEMPTS} attempts over $(format_duration "${elapsed}")) - latest result: ${reason}"
+}
+
+reset_gateway_discovery_tracking() {
+    if [ "${GATEWAY_DISCOVERY_ATTEMPTS}" -gt 0 ] && [ "${GATEWAY_DISCOVERY_STALLED_SINCE}" -gt 0 ]; then
+        local now
+        now=$(date +%s)
+        local elapsed=$((now - GATEWAY_DISCOVERY_STALLED_SINCE))
+        log_info "Mesh gateway restored after ${GATEWAY_DISCOVERY_ATTEMPTS} attempts spanning $(format_duration "${elapsed}")"
+    fi
+    
+    GATEWAY_DISCOVERY_ATTEMPTS=0
+    GATEWAY_DISCOVERY_STALLED_SINCE=0
+    GATEWAY_DISCOVERY_LAST_REASON=""
+}
+
+# Core rate-limited logging helper. Every caller supplies a unique key so
+# we only emit a line at most once per interval unless the message changes.
+log_rate_limited() {
+    local level="$1"
+    local key="$2"
+    local interval="$3"
+    shift 3
+    local message="$*"
+    local now
+    now=$(date +%s)
+    local last_time="${LOG_LAST_EVENT_TIME[$key]:-0}"
+    
+    if [ $((now - last_time)) -lt "${interval}" ]; then
+        return
+    fi
+    
+    LOG_LAST_EVENT_TIME[$key]=$now
+    
+    case "$level" in
+        debug) log_debug "$message" ;;
+        info) log_info "$message" ;;
+        warn) log_warn "$message" ;;
+        error) log_error "$message" ;;
+        *) log_info "$message" ;;
+    esac
+}
+
+# Helper for one-off operations (like gateway scans) where we only care
+# about emitting a log if the action runs longer than a threshold.
+log_elapsed_if_slow() {
+    local start_ts="$1"
+    local label="$2"
+    local threshold="${3:-5}"
+    local key="$4"
+    local now
+    now=$(date +%s)
+    local duration=$((now - start_ts))
+    if [ "${duration}" -lt "${threshold}" ]; then
+        return
+    fi
+    log_rate_limited "info" "${key}" "${threshold}" "${label} took ${duration}s"
+}
+
+log_gateway_discovery_progress() {
+    local start_ts="$1"
+    local stage="$2"
+    local interval="${3:-15}"
+    local now
+    now=$(date +%s)
+    local elapsed=$((now - start_ts))
+    if [ "${elapsed}" -lt "${interval}" ]; then
+        return
+    fi
+    local message="Gateway discovery still running ($(format_duration "${elapsed}"))"
+    if [ -n "${stage}" ]; then
+        message="${message} - ${stage}"
+    fi
+    log_rate_limited "info" "gateway_detection_progress" "${interval}" "${message}"
+}
+
+# Lightweight stopwatch helpers so we know which phase of the monitor loop
+# is taking the longest.
+monitor_phase_start() {
+    local phase="$1"
+    MONITOR_PHASE_DURATION["${phase}_start"]=$(date +%s)
+}
+
+monitor_phase_end() {
+    local phase="$1"
+    local start_ts="${MONITOR_PHASE_DURATION["${phase}_start"]:-0}"
+    if [ "${start_ts}" -eq 0 ]; then
+        return 0
+    fi
+    local end_ts
+    end_ts=$(date +%s)
+    local duration=$((end_ts - start_ts))
+    MONITOR_PHASE_DURATION["${phase}_duration"]=$duration
+    MONITOR_PHASE_DURATION["${phase}_start"]=0
+    echo "${duration}"
+}
+
+# Convenience wrapper used throughout the monitor loop to emit a single
+# INFO line when a specific phase exceeded its expected duration.
+monitor_phase_log_if_slow() {
+    local phase="$1"
+    local label="$2"
+    local threshold="${3:-5}"
+    local duration
+    duration=$(monitor_phase_end "${phase}")
+    if [ -z "${duration}" ] || [ "${duration}" -lt "${threshold}" ]; then
+        return
+    fi
+    log_rate_limited "info" "phase_${phase}_slow" "${threshold}" "${label} took ${duration}s"
+}
+
+# Reset the per-phase timing map between monitor cycles so we only report
+# fresh data each time.
+clear_monitor_phase_metrics() {
+    for key in "${!MONITOR_PHASE_DURATION[@]}"; do
+        if [[ "$key" == *_duration ]]; then
+            MONITOR_PHASE_DURATION[$key]=0
+        fi
+    done
 }
 
 error() {
@@ -194,6 +414,11 @@ is_interface_up() {
     fi
     
     return 0
+}
+
+get_interface_ipv4() {
+    local interface="$1"
+    ip -4 addr show dev "$interface" 2>/dev/null | awk '/inet / {print $2}' | cut -d'/' -f1 | head -n1
 }
 
 # Unified route management
@@ -526,11 +751,18 @@ evaluate_wan_status() {
 # Global state tracking for interfaces
 declare -A WAN_INTERFACE_STATE
 declare -A WAN_INTERFACE_LAST_LOG
+declare -A WAN_INTERFACE_FAIL_STREAK
+declare -A WAN_INTERFACE_LAST_SUCCESS
+declare -A WAN_INTERFACE_LAST_FAILURE
+
+declare -A GATEWAY_FAIL_COUNT
+declare -A GATEWAY_LAST_SUCCESS
 
 # Check WAN connectivity
 check_wan_connectivity() {
     local wan_iface="$1"
     local log_check="$2"  # Optional parameter - kept for compatibility
+    local probe_mode="${3:-full}"
     
     # Initialize state tracking for this interface if not already done
     if [ -z "${WAN_INTERFACE_STATE[$wan_iface]}" ]; then
@@ -579,45 +811,88 @@ check_wan_connectivity() {
         fi
     fi
     
-    # Try multiple connectivity tests for more reliable detection
-    local success=0
+    # Track per-interface success/failure streaks for observability
+    if [ -z "${WAN_INTERFACE_FAIL_STREAK[$wan_iface]}" ]; then
+        WAN_INTERFACE_FAIL_STREAK[$wan_iface]=0
+    fi
+    if [ -z "${WAN_INTERFACE_LAST_SUCCESS[$wan_iface]}" ]; then
+        WAN_INTERFACE_LAST_SUCCESS[$wan_iface]=0
+    fi
+    if [ -z "${WAN_INTERFACE_LAST_FAILURE[$wan_iface]}" ]; then
+        WAN_INTERFACE_LAST_FAILURE[$wan_iface]=0
+    fi
     
-    # Test 1: Try to ping the default gateway first
+    local previous_state="${WAN_INTERFACE_STATE[$wan_iface]}"
+    
+    # Connectivity probes scoped to this interface. Run the gateway ping
+    # and outbound internet check in parallel so the first success wins.
     local default_gw=$(get_interface_gateway "$wan_iface")
-    if [ -n "${default_gw}" ] && ping -c 1 -W 1 "${default_gw}" >/dev/null 2>&1; then
-        success=$((success + 1))
+    local ping_timeout=2
+    if [ "${probe_mode}" = "fast" ]; then
+        ping_timeout=1
     fi
     
-    # Test 2: Check connection to DNS servers
-    if check_internet_connectivity; then
-        success=$((success + 1))
+    declare -A probe_pids=()
+    if [ -n "${default_gw}" ]; then
+        (
+            timeout "${ping_timeout}" ping -I "${wan_iface}" -c 1 -W 1 "${default_gw}" >/dev/null 2>&1
+        ) &
+        probe_pids[$!]="${wan_iface}_gateway"
     fi
     
-    # Success if either the gateway is reachable or internet connectivity check succeeded
-    if [ $success -ge 1 ]; then
-        # Interface has connectivity - has state changed?
-        if [ "${WAN_INTERFACE_STATE[$wan_iface]}" != "up" ]; then
+    (
+        check_interface_internet_connectivity "${wan_iface}" "${probe_mode}"
+    ) &
+    probe_pids[$!]="${wan_iface}_internet"
+    
+    local probe_success=1
+    for pid in "${!probe_pids[@]}"; do
+        if wait "${pid}"; then
+            probe_success=0
+            for other_pid in "${!probe_pids[@]}"; do
+                if [ "${other_pid}" != "${pid}" ]; then
+                    kill "${other_pid}" 2>/dev/null || true
+                fi
+            done
+            break
+        fi
+    done
+    
+    for pid in "${!probe_pids[@]}"; do
+        wait "${pid}" 2>/dev/null || true
+    done
+    
+    if [ ${probe_success} -eq 0 ]; then
+        WAN_INTERFACE_FAIL_STREAK[$wan_iface]=0
+        WAN_INTERFACE_LAST_SUCCESS[$wan_iface]=$current_time
+        
+        if [ "${previous_state}" != "up" ]; then
             log_info "WAN interface $wan_iface now has internet connectivity"
             WAN_INTERFACE_STATE[$wan_iface]="up"
             WAN_INTERFACE_LAST_LOG[$wan_iface]=$current_time
         elif [ $((current_time - ${WAN_INTERFACE_LAST_LOG[$wan_iface]})) -gt 1800 ]; then
-            # Log very infrequently (every 30 minutes) even without state change for confirmation of continued uptime
             log_debug "WAN interface $wan_iface continues to have internet connectivity"
             WAN_INTERFACE_LAST_LOG[$wan_iface]=$current_time
         fi
+        
+        WAN_INTERFACE_STATE[$wan_iface]="up"
+        
         return 0
     fi
     
-    # Interface up but no connectivity - has state changed?
-    if [ "${WAN_INTERFACE_STATE[$wan_iface]}" != "no_internet" ]; then
+    local failure_count=$(( ${WAN_INTERFACE_FAIL_STREAK[$wan_iface]} + 1 ))
+    WAN_INTERFACE_FAIL_STREAK[$wan_iface]=$failure_count
+    WAN_INTERFACE_LAST_FAILURE[$wan_iface]=$current_time
+    
+    if [ "${previous_state}" != "no_internet" ]; then
         log_warn "WAN interface $wan_iface is up but has no internet connectivity"
         WAN_INTERFACE_STATE[$wan_iface]="no_internet"
         WAN_INTERFACE_LAST_LOG[$wan_iface]=$current_time
     elif [ $((current_time - ${WAN_INTERFACE_LAST_LOG[$wan_iface]})) -gt 300 ]; then
-        # Log periodically (every 5 minutes) even without state change
-        log_debug "WAN interface $wan_iface still has no internet connectivity"
+        log_debug "WAN interface $wan_iface still has no internet connectivity (fail streak ${failure_count})"
         WAN_INTERFACE_LAST_LOG[$wan_iface]=$current_time
     fi
+    
     return 1
 }
 
@@ -773,9 +1048,21 @@ is_gateway_available() {
     return 1  # Not found anywhere
 }
 
-# Function to monitor gateway
+# Function to monitor gateway. We combine ICMP tests with batctl table
+# checks and track failure streaks so we only tear down a gateway when we
+# are confident it disappeared from the mesh.
 monitor_gateway() {
     local current_gateway="$1"
+    local cutoff_fail_count="${2:-${DEFAULT_GATEWAY_FAIL_COUNT}}"
+    local cutoff_window="${3:-${DEFAULT_GATEWAY_FAIL_WINDOW}}"
+    
+    if [ -z "${current_gateway}" ]; then
+        echo "true"
+        return
+    fi
+    
+    local current_time
+    current_time=$(date +%s)
     
     # Initialize translation table if needed
     init_translation_table || return 0
@@ -783,6 +1070,31 @@ monitor_gateway() {
     # If we're in server mode and this is our IP, we're always available
     if [ "${BATMAN_GW_MODE}" = "server" ] && [ "${current_gateway}" = "${NODE_IP}" ]; then
         echo "false"  # Not unreachable
+        return
+    fi
+    
+    if [ -z "${GATEWAY_FAIL_COUNT[$current_gateway]}" ]; then
+        GATEWAY_FAIL_COUNT[$current_gateway]=0
+    fi
+    if [ -z "${GATEWAY_LAST_SUCCESS[$current_gateway]}" ]; then
+        GATEWAY_LAST_SUCCESS[$current_gateway]=$current_time
+    fi
+    
+    local ping_success=false
+    local attempt=1
+    while [ $attempt -le 3 ]; do
+        if timeout 2 ping -I bat0 -c 1 -W 1 "${current_gateway}" >/dev/null 2>&1; then
+            ping_success=true
+            break
+        fi
+        attempt=$((attempt + 1))
+        sleep 0.2
+    done
+    
+    if [ "${ping_success}" = "true" ]; then
+        GATEWAY_FAIL_COUNT[$current_gateway]=0
+        GATEWAY_LAST_SUCCESS[$current_gateway]=$current_time
+        echo "false"
         return
     fi
     
@@ -802,17 +1114,70 @@ monitor_gateway() {
         bat0_mac=$(batctl translate "${current_gateway}" 2>/dev/null | grep -oE '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' | head -n1)
     fi
     
-    # Check if the gateway is still available
+    local mac_available=false
     if [ -n "${bat0_mac}" ] && is_gateway_available "${bat0_mac}"; then
-        echo "false"  # Not unreachable
+        mac_available=true
+    fi
+    
+    if [ "${mac_available}" = "false" ]; then
+        echo "true"
+        return
+    fi
+    
+    local fail_count=$(( ${GATEWAY_FAIL_COUNT[$current_gateway]} + 1 ))
+    GATEWAY_FAIL_COUNT[$current_gateway]=$fail_count
+    
+    # Surface the countdown so operators know when a failover will occur.
+    if [ ${fail_count} -lt ${cutoff_fail_count} ]; then
+        local remaining=$((cutoff_fail_count - fail_count))
+        local eta=$((remaining * ${MONITOR_LOOP_INTERVAL:-5}))
+        log_rate_limited "info" "gateway_wait_${current_gateway}" 5 "Gateway ${current_gateway} ping failed (${fail_count}/${cutoff_fail_count}). Waiting ~${eta}s before rerouting."
+    fi
+    
+    local last_success=${GATEWAY_LAST_SUCCESS[$current_gateway]}
+    if [ -z "${last_success}" ] || [ "${last_success}" -eq 0 ]; then
+        GATEWAY_LAST_SUCCESS[$current_gateway]=$current_time
+        echo "false"
+        return
+    fi
+    
+    local time_since_success=$((current_time - last_success))
+    if [ ${fail_count} -ge ${cutoff_fail_count} ] && [ ${time_since_success} -gt ${cutoff_window} ]; then
+        echo "true"
     else
-        echo "true"  # Unreachable
+        local remaining_fail=$((cutoff_fail_count - fail_count))
+        if [ ${remaining_fail} -lt 0 ]; then remaining_fail=0; fi
+        local remaining_time=$((cutoff_window - time_since_success))
+        if [ ${remaining_time} -lt 0 ]; then remaining_time=0; fi
+        # Keep reminding at a low rate that the gateway is still in
+        # grace-period evaluation so the operator is not left in the dark.
+        log_rate_limited "info" "gateway_pending_${current_gateway}" 5 \
+            "Gateway ${current_gateway} still being validated (fails ${fail_count}/${cutoff_fail_count}, $(format_duration "${remaining_time}") since last success)."
+        echo "false"
     fi
 }
 
-# Function to detect gateway IP
-# Scans network for IPs, gets vmac from each IP with 'batctl translate $ip', matches it with vmac from 'batctl gwl -n'
+flush_gateway_state() {
+    local gw_ip="$1"
+    if [ -z "${gw_ip}" ]; then
+        return
+    fi
+    
+    # Remove ARP/neighbor entries and force batctl to refresh so that
+    # subsequent discovery attempts don't keep reusing stale data.
+    ip neigh del "${gw_ip}" dev bat0 2>/dev/null || true
+    batctl o -n >/dev/null 2>&1 || true
+}
+
+# Function to detect gateway IP.
+# We try cached/known nodes first, then arp-scan the mesh subnet, translate
+# each IP to its batman-adv MAC, and match it against the gateway list.
+# Logging hooks explain why discovery takes time and how many attempts
+# have already run.
 detect_gateway_ip() {
+    local detection_start
+    detection_start=$(date +%s)
+    log_rate_limited "info" "gateway_detection_start" 60 "Gateway discovery scan started" >&2
     # Redirect debug output to stderr
     log_debug "Starting gateway detection" >&2
     
@@ -885,6 +1250,14 @@ detect_gateway_ip() {
     
     # Use cached scan results if available
     local mesh_nodes=""
+    local now_ts
+    now_ts=$(date +%s)
+    if [ -z "${MESH_SCAN_CACHE}" ] && [ -n "${MESH_SCAN_CACHE_DATA}" ]; then
+        if [ $((now_ts - MESH_SCAN_CACHE_TS)) -lt ${MESH_SCAN_CACHE_TTL} ]; then
+            MESH_SCAN_CACHE="${MESH_SCAN_CACHE_DATA}"
+        fi
+    fi
+    
     if [ -n "${MESH_SCAN_CACHE}" ]; then
         log_debug "Using cached scan results" >&2
         mesh_nodes="${MESH_SCAN_CACHE}"
@@ -927,9 +1300,13 @@ detect_gateway_ip() {
             # Extract IPs and MACs from scan output, skipping header and footer lines
             mesh_nodes=$(echo "${scan_output}" | grep -v "Interface:" | grep -v "Starting" | grep -v "packets" | grep -v "Ending" | grep -v "WARNING")
         fi
+        
+        MESH_SCAN_CACHE_DATA="${mesh_nodes}"
+        MESH_SCAN_CACHE_TS=$now_ts
     fi
     
     if [ -z "${mesh_nodes}" ]; then
+        log_elapsed_if_slow "${detection_start}" "Gateway discovery scan" 15 "gateway_detection_progress" >&2
         log_debug "No nodes found by arp-scan" >&2
         # Try known gateways as a last resort if we have any
         if [ -n "${known_gateways}" ]; then
@@ -947,6 +1324,7 @@ detect_gateway_ip() {
     fi
     
     log_debug "Found mesh nodes: ${mesh_nodes}" >&2
+    log_gateway_discovery_progress "${detection_start}" "processing mesh nodes" >&2
     
     # Cache translation results to avoid redundant calls
     declare -A ip_to_mac_cache
@@ -954,6 +1332,7 @@ detect_gateway_ip() {
     # First try to match using originator MACs directly - faster matching
     for gateway_mac in ${gateway_macs}; do
         log_debug "Looking for match with gateway MAC: ${gateway_mac}" >&2
+        log_gateway_discovery_progress "${detection_start}" "matching gateway MACs" >&2
         
         # Process each discovered node
         while read -r ip hw_mac _; do
@@ -992,6 +1371,7 @@ detect_gateway_ip() {
                     if is_gateway_available "${virtual_mac}"; then
                         log_debug "Gateway ${ip} is available" >&2
                         printf "%s\n" "${ip}"
+                        log_elapsed_if_slow "${detection_start}" "Gateway discovery scan" 15 "gateway_detection_progress" >&2
                         return 0
                     else
                         log_debug "Gateway ${ip} is not available in batman-adv" >&2
@@ -1001,6 +1381,7 @@ detect_gateway_ip() {
         done <<< "${mesh_nodes}"
     done
     
+    log_elapsed_if_slow "${detection_start}" "Gateway discovery scan" 15 "gateway_detection_progress" >&2
     # If no direct match, look for any potential gateway
     log_debug "No direct match found, checking if any node can be a gateway" >&2
     
@@ -1012,6 +1393,7 @@ detect_gateway_ip() {
         [ "${ip}" = "${NODE_IP}" ] && continue
         
         log_debug "Checking IP ${ip} (MAC: ${hw_mac})" >&2
+        log_gateway_discovery_progress "${detection_start}" "evaluating fallback nodes" >&2
         
         # Get virtual MAC for this IP using batctl translate
         local virtual_mac
@@ -1040,6 +1422,7 @@ detect_gateway_ip() {
                 log "Found usable mesh node! IP: ${ip}, MAC: ${virtual_mac}" >&2
                 log "Gateway ${ip} is available" >&2
                 printf "%s\n" "${ip}"
+                log_elapsed_if_slow "${detection_start}" "Gateway discovery scan" 15 "gateway_detection_progress" >&2
                 return 0
             else
                 log "Mesh node ${ip} is not available as gateway" >&2
@@ -1049,6 +1432,7 @@ detect_gateway_ip() {
         fi
     done <<< "${mesh_nodes}"
     
+    log_elapsed_if_slow "${detection_start}" "Gateway discovery scan" 15 "gateway_detection_progress" >&2
     return 1
 }
 
@@ -1964,9 +2348,13 @@ check_requirements() {
 # MONITORING AND SERVICE FUNCTIONS
 #######################################
 
-# Monitor mesh network for changes in gateway mode and fallback routes, runs continuously
+# Monitor mesh network for changes in gateway mode and fallback routes.
+# This is the heart of the controller: it probes WAN links, validates
+# mesh gateways, reconciles routes, and writes human-readable status.
+# Extensive logging + timing is built in so operators can see *why*
+# failover is taking as long as it is.
 monitor_mesh_network() {
-    local RETRY_INTERVAL=5  # Time between retries in seconds
+    local RETRY_INTERVAL=${MONITOR_LOOP_INTERVAL:-5}  # Time between retries in seconds
     
     # Set up status directory for real-time status updates
     setup_status_directory
@@ -2043,6 +2431,9 @@ monitor_mesh_network() {
     update_route_status "${current_mode}" "${wan_available}" "${primary_route_configured}" "${fallback_route_configured}" "${active_wan}" "${wan_stable_count}" "${wan_required_stable_count}" "${wan_fail_count}" "${wan_required_fail_count}" "${initial_internet_available}"
     
     while true; do
+        local cycle_start_ts
+        cycle_start_ts=$(date +%s)
+        log_debug "Monitor cycle start - mode=${current_mode}, WAN=${wan_available}, gateway=${current_gateway:-none}"
         # Check if bat0 interface is up
         if ! ip link show bat0 >/dev/null 2>&1 || ! ip link show bat0 | grep -q "UP"; then
             log_error "bat0 interface not ready or down, waiting..."
@@ -2050,17 +2441,51 @@ monitor_mesh_network() {
             continue
         fi
 
-        # Check connection to DNS servers
-        local internet_available=false
-        if check_internet_connectivity; then
-            internet_available=true
+        # Check internet reachability with adaptive probing. When WAN is
+        # already down we reuse the cached result and only run a quick
+        # verification periodically so the loop keeps cycling quickly.
+        local internet_available="${GLOBAL_PROBE_LAST_RESULT}"
+        local now_ts=$(date +%s)
+        local run_probe=false
+        local probe_mode="full"
+        
+        if [ "${wan_available}" = "true" ] || [ "${GLOBAL_PROBE_LAST_TS}" -eq 0 ]; then
+            run_probe=true
+            probe_mode="full"
+        elif [ $((now_ts - GLOBAL_PROBE_LAST_TS)) -ge ${GLOBAL_PROBE_CACHE_TTL} ]; then
+            run_probe=true
+            probe_mode="fast"
+        else
+            log_debug "Reusing cached internet probe result (${GLOBAL_PROBE_LAST_RESULT}) from ${GLOBAL_PROBE_LAST_MODE} mode"
+        fi
+        
+        if [ "${run_probe}" = "true" ]; then
+            monitor_phase_start "global_internet_check"
+            if check_internet_connectivity "${probe_mode}"; then
+                internet_available=true
+            else
+                internet_available=false
+            fi
+            monitor_phase_log_if_slow "global_internet_check" "Global internet reachability check" 5
+            GLOBAL_PROBE_LAST_RESULT="${internet_available}"
+            GLOBAL_PROBE_LAST_TS=$now_ts
+            GLOBAL_PROBE_LAST_MODE="${probe_mode}"
         fi
 
         # Check WAN connectivity on all possible interfaces
         local current_wan_status=false
         active_wan=""
+        local probe_mode_for_wan="full"
+        if [ "${wan_available}" = "false" ]; then
+            probe_mode_for_wan="fast"
+        fi
+        local loop_sleep_interval="${RETRY_INTERVAL}"
+        if [ "${wan_available}" = "false" ] && [ "${current_mode}" = "client" ]; then
+            loop_sleep_interval="${FAST_MONITOR_LOOP_INTERVAL}"
+        fi
 
-        # Try both potential WAN interfaces will set good one to 'active_wan'
+        # Try both potential WAN interfaces; the probe mode shifts to
+        # "fast" whenever we've already lost WAN so the loop keeps moving.
         for iface in "${VALID_WAN}" "${ETH_WAN}"; do
             if [ -n "${iface}" ]; then
                 # Make sure interface is up first
@@ -2072,11 +2497,15 @@ monitor_mesh_network() {
                 fi
 
                 # Check connectivity - function handles its own logging
-                if check_wan_connectivity "${iface}" "${wan_fail_count}"; then
+                local phase_name="wan_probe_${iface}"
+                monitor_phase_start "${phase_name}"
+                if check_wan_connectivity "${iface}" "${wan_fail_count}" "${probe_mode_for_wan}"; then
                     current_wan_status=true
                     active_wan="${iface}"
+                    monitor_phase_log_if_slow "${phase_name}" "WAN probe on ${iface}" 5
                     break
                 fi
+                monitor_phase_log_if_slow "${phase_name}" "WAN probe on ${iface}" 5
             fi
         done
 
@@ -2092,6 +2521,14 @@ monitor_mesh_network() {
         # Update counters based on evaluation result
         wan_stable_count="${new_stable_count}"
         wan_fail_count="${new_fail_count}"
+        
+        if [ "${wan_available}" = "false" ] && [ "${wan_fail_count}" -gt 0 ]; then
+            local remaining_checks=$((wan_required_fail_count - wan_fail_count))
+            if [ ${remaining_checks} -gt 0 ]; then
+                local eta=$((remaining_checks * loop_sleep_interval))
+                log_rate_limited "info" "wan_fail_wait" 10 "WAN probes failing (${wan_fail_count}/${wan_required_fail_count}); reassessing in ~${eta}s"
+            fi
+        fi
         
         # Record previous state for logic below
         local previous_wan_state="${wan_available}"
@@ -2202,10 +2639,12 @@ monitor_mesh_network() {
                 setup_mesh_fallback_route
             elif [ -n "${current_gateway}" ]; then
                 # Check if fallback gateway is still valid
-                    unreachable=$(monitor_gateway "${current_gateway}")
+                    unreachable=$(monitor_gateway "${current_gateway}" "${DEFAULT_GATEWAY_FAIL_COUNT}" "${DEFAULT_GATEWAY_FAIL_WINDOW}")
                     if [ "${unreachable}" = "true" ]; then
-                    log_warn "Fallback gateway ${current_gateway} is unreachable, removing route"
-                    ip route del default via "${current_gateway}" dev bat0 metric 200 2>/dev/null || true
+                    local removed_gateway="${current_gateway}"
+                    log_warn "Fallback gateway ${removed_gateway} is unreachable, removing route"
+                    ip route del default via "${removed_gateway}" dev bat0 metric 200 2>/dev/null || true
+                    flush_gateway_state "${removed_gateway}"
                     fallback_route_configured=false
                     current_gateway=""
                     
@@ -2243,10 +2682,18 @@ monitor_mesh_network() {
                 fi
                 
                 # Check if current mesh gateway is still valid
-                unreachable=$(monitor_gateway "${current_gateway}")
+                local gw_fail_count_threshold="${DEFAULT_GATEWAY_FAIL_COUNT}"
+                local gw_fail_window="${DEFAULT_GATEWAY_FAIL_WINDOW}"
+                if [ "${current_mode}" = "client" ] && [ "${wan_available}" = "false" ]; then
+                    gw_fail_count_threshold="${FAST_GATEWAY_FAIL_COUNT}"
+                    gw_fail_window="${FAST_GATEWAY_FAIL_WINDOW}"
+                fi
+                unreachable=$(monitor_gateway "${current_gateway}" "${gw_fail_count_threshold}" "${gw_fail_window}")
                 if [ "${unreachable}" = "true" ]; then
-                    log_warn "Current mesh gateway ${current_gateway} is unreachable, removing route"
-                    ip route del default via "${current_gateway}" dev bat0 2>/dev/null || true
+                    local removed_gateway="${current_gateway}"
+                    log_warn "Current mesh gateway ${removed_gateway} is unreachable, removing route"
+                    ip route del default via "${removed_gateway}" dev bat0 2>/dev/null || true
+                    flush_gateway_state "${removed_gateway}"
                     primary_route_configured=false
                     current_gateway=""
                     setup_mesh_primary_route
@@ -2304,9 +2751,13 @@ monitor_mesh_network() {
         # Clean up translation table occasionally
         clean_translation_table 
         
-        # Log status on changes or periodically (every 15 minutes)
+        # Log status on changes or periodically (at least every 60 seconds)
         local current_time=$(date +%s)
         local status_changed=false
+        local status_due=false
+        if [ $((current_time - last_status_log)) -gt 60 ]; then
+            status_due=true
+        fi
         
         # Check if mode has changed
         if [ "$current_mode" != "$last_mode" ]; then
@@ -2332,14 +2783,13 @@ monitor_mesh_network() {
             last_wan_status=$wan_available
         fi
         
-        # Log on status change or every 15 minutes
-        if [ "$status_changed" = "true" ] || [ $((current_time - last_status_log)) -gt 900 ]; then
+        if [ "$status_changed" = "true" ]; then
             log_info "Status update - Mode: ${current_mode}, WAN: ${wan_available}, Primary route: ${primary_route_configured}, Fallback: ${fallback_route_configured}"
-            
-            # Update status file
+        fi
+        
+        if [ "$status_changed" = "true" ] || [ "${status_due}" = "true" ]; then
             update_route_status "${current_mode}" "${wan_available}" "${primary_route_configured}" "${fallback_route_configured}" "${active_wan}" "${wan_stable_count}" "${wan_required_stable_count}" "${wan_fail_count}" "${wan_required_fail_count}" "${internet_available}"
             
-            # Only show WAN stability counters if there's actually a WAN interface with carrier signal
             local wan_carrier=false
             for iface in "${VALID_WAN}" "${ETH_WAN}"; do
                 if [ -n "${iface}" ] && ip link show "${iface}" 2>/dev/null | grep -qv "NO-CARRIER"; then
@@ -2352,20 +2802,53 @@ monitor_mesh_network() {
                 log_debug "WAN stability counters - Up: ${wan_stable_count}/${wan_required_stable_count}, Down: ${wan_fail_count}/${wan_required_fail_count}"
             fi
             
-            ip route show | grep default | while read -r route; do
-                log_debug "Route: ${route}"
-            done
+            if [ "$status_changed" = "true" ]; then
+                ip route show | grep default | while read -r route; do
+                    log_debug "Route: ${route}"
+                done
+            fi
             
             last_status_log=$current_time
         fi
         
-        sleep "${RETRY_INTERVAL}"
+        # Even without explicit state changes we emit a slow heartbeat so
+        # operators can see live counters and know the monitor loop is healthy.
+        log_rate_limited "info" "state_snapshot" 60 "State snapshot: mode=${current_mode}, WAN=${wan_available}, mesh_gateway=${current_gateway:-none}, WAN fail ${wan_fail_count}/${wan_required_fail_count}, gateway attempts=${GATEWAY_DISCOVERY_ATTEMPTS}"
+        
+        local cycle_end_ts
+        cycle_end_ts=$(date +%s)
+        local cycle_duration=$((cycle_end_ts - cycle_start_ts))
+        local slowest_phase=""
+        local slowest_duration=0
+        for key in "${!MONITOR_PHASE_DURATION[@]}"; do
+            if [[ "$key" == *_duration ]]; then
+                local duration="${MONITOR_PHASE_DURATION[$key]}"
+                if [ -n "${duration}" ] && [ "${duration}" -gt "${slowest_duration}" ]; then
+                    slowest_duration="${duration}"
+                    slowest_phase="${key%_duration}"
+                fi
+            fi
+        done
+        clear_monitor_phase_metrics
+        
+        if [ "${cycle_duration}" -ge $((RETRY_INTERVAL * 2)) ]; then
+            if [ -n "${slowest_phase}" ] && [ "${slowest_duration}" -gt 0 ]; then
+                log_rate_limited "warn" "monitor_cycle_slow" 20 "Monitor cycle took ${cycle_duration}s (expected ~${RETRY_INTERVAL}s); slowest phase ${slowest_phase} ${slowest_duration}s"
+            else
+                log_rate_limited "warn" "monitor_cycle_slow" 20 "Monitor cycle took ${cycle_duration}s (expected ~${RETRY_INTERVAL}s)"
+            fi
+        else
+            log_debug "Monitor cycle completed in ${cycle_duration}s"
+        fi
+        
+        sleep "${loop_sleep_interval}"
     done
 }
 
 # Add helper functions for mesh route management
 setup_mesh_primary_route() {
-    log_info "Setting up primary route via mesh network..."
+    log_rate_limited "info" "setup_mesh_primary_route" 20 "Setting up primary route via mesh network..."
+    monitor_phase_start "mesh_primary_route"
     
     # First try last known gateway if we have one
     if [ -n "${last_known_mesh_gateway}" ] && [ "${last_known_mesh_gateway}" != "${NODE_IP}" ]; then
@@ -2377,10 +2860,11 @@ setup_mesh_primary_route() {
             if add_route "${last_known_mesh_gateway}" "bat0" "100"; then
                 primary_route_configured=true
                 current_gateway="${last_known_mesh_gateway}"
+                reset_gateway_discovery_tracking
                 return 0
             fi
         else
-            log_info "Last known mesh gateway is not reachable, will search for others"
+            record_gateway_discovery_failure "Last known mesh gateway ${last_known_mesh_gateway} unreachable"
         fi
     fi
     
@@ -2397,19 +2881,25 @@ setup_mesh_primary_route() {
         if add_route "${mesh_gateway}" "bat0" "100"; then
             primary_route_configured=true
             current_gateway="${mesh_gateway}"
+            reset_gateway_discovery_tracking
+            monitor_phase_log_if_slow "mesh_primary_route" "Mesh primary route setup" 5
             return 0
         else
             log_error "Failed to add primary route via mesh"
             return 1
         fi
     else
-        log_info "No suitable mesh gateway found, will retry"
+        monitor_phase_log_if_slow "mesh_primary_route" "Mesh primary route setup" 5
+        record_gateway_discovery_failure "No suitable mesh gateway found during discovery scan"
         return 1
     fi
+    
 }
 
 setup_mesh_fallback_route() {
-    log_info "Attempting to configure fallback route via mesh network..."
+    # Rate-limit the attempt log so we don't spam every 5s when no mesh
+    # peers are reachable, but still keep the operator informed.
+    log_rate_limited "info" "setup_mesh_fallback_route" 30 "Attempting to configure fallback route via mesh network..."
     
     # If we already have a fallback route, check if it's still valid
     if ip route show | grep -q "default via .* dev bat0 metric 200"; then
@@ -2437,7 +2927,7 @@ setup_mesh_fallback_route() {
             fallback_gateway="${last_known_mesh_gateway}"
             log_debug "Last known mesh gateway ${fallback_gateway} is reachable"
         else
-            log_info "Last known mesh gateway ${last_known_mesh_gateway} is not reachable, will search for others"
+            log_rate_limited "info" "fallback_last_known_unreachable" 60 "Fallback check: last known mesh gateway ${last_known_mesh_gateway} unreachable, searching for others"
         fi
     fi
     
@@ -2464,7 +2954,7 @@ setup_mesh_fallback_route() {
             return 1
         fi
     else
-        log_info "No suitable fallback gateway found, will retry later"
+        log_rate_limited "info" "fallback_gateway_missing" 30 "No suitable fallback mesh gateway found, will retry later"
         return 1
     fi
 }
@@ -2481,6 +2971,64 @@ cleanup() {
 #######################################
 # Status File Management
 #######################################
+
+# Connectivity helper pinned to interface
+check_interface_internet_connectivity() {
+    local interface="$1"
+    local mode="${2:-full}"
+    local timeout=2
+    local dns_targets=(9.9.9.9 8.8.8.8 1.1.1.1 208.67.222.222)
+    local max_dns="${#dns_targets[@]}"
+    
+    if [ -z "${interface}" ]; then
+        return 1
+    fi
+    
+    if ! ip link show "${interface}" >/dev/null 2>&1; then
+        return 1
+    fi
+    
+    if ! ip addr show dev "${interface}" | grep -q "inet "; then
+        return 1
+    fi
+    
+    if [ "${mode}" = "fast" ]; then
+        timeout=1
+        max_dns=1
+    fi
+    
+    for ((i=0; i<max_dns; i++)); do
+        local dns="${dns_targets[$i]}"
+        if timeout "${timeout}" ping -I "${interface}" -c 1 -W 1 "${dns}" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    
+    if [ "${mode}" = "fast" ]; then
+        return 1
+    fi
+    
+    if command -v curl >/dev/null 2>&1; then
+        if timeout "${timeout}" curl --interface "${interface}" -s --head --connect-timeout 1 --max-time 2 http://www.google.com/ >/dev/null 2>&1 ||
+           timeout "${timeout}" curl --interface "${interface}" -s --head --connect-timeout 1 --max-time 2 http://www.apple.com/ >/dev/null 2>&1 ||
+           timeout "${timeout}" curl --interface "${interface}" -s --head --connect-timeout 1 --max-time 2 http://www.cloudflare.com/ >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    
+    local iface_ip
+    iface_ip=$(get_interface_ipv4 "${interface}")
+    
+    if [ -n "${iface_ip}" ] && command -v wget >/dev/null 2>&1; then
+        if timeout "${timeout}" wget -q --spider --bind-address="${iface_ip}" http://www.google.com/ >/dev/null 2>&1 ||
+           timeout "${timeout}" wget -q --spider --bind-address="${iface_ip}" http://www.apple.com/ >/dev/null 2>&1 ||
+           timeout "${timeout}" wget -q --spider --bind-address="${iface_ip}" http://www.cloudflare.com/ >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    
+    return 1
+}
 
 # Setup status directory 
 setup_status_directory() {
@@ -2504,37 +3052,44 @@ setup_status_directory() {
 
 # Function to check if internet is accessible through any interface
 check_internet_connectivity() {
+    local mode="${1:-full}"
+    local timeout=2
     local success=0
-    local timeout=2  # Shorter timeout for faster checks
+    local dns_targets=(9.9.9.9 8.8.8.8 1.1.1.1 208.67.222.222)
+    local max_dns="${#dns_targets[@]}"
     
-    # Try multiple DNS servers
-    for dns in 9.9.9.9 8.8.8.8 1.1.1.1 208.67.222.222; do
-        if timeout ${timeout} ping -c 1 -W 1 ${dns} >/dev/null 2>&1; then
-            success=$((success + 1))
-            break  # One successful DNS ping is enough
+    if [ "${mode}" = "fast" ]; then
+        timeout=1
+        max_dns=1
+    fi
+    
+    # Try multiple DNS servers, but exit early once we find a responder.
+    for ((i=0; i<max_dns; i++)); do
+        local dns="${dns_targets[$i]}"
+        if timeout "${timeout}" ping -c 1 -W 1 "${dns}" >/dev/null 2>&1; then
+            success=1
+            break
         fi
     done
     
-    # If DNS ping failed, try HTTP check as backup
-    if [ $success -eq 0 ]; then
-        # Try curl with a short timeout
+    # Only run the heavier HTTP/SPDY checks during a full probe; the
+    # "fast" mode is designed to return quickly to keep the loop moving.
+    if [ $success -eq 0 ] && [ "${mode}" = "full" ]; then
         if command -v curl >/dev/null 2>&1; then
-            if timeout ${timeout} curl -s --head --connect-timeout 1 --max-time 2 http://www.google.com/ >/dev/null 2>&1 || 
-               timeout ${timeout} curl -s --head --connect-timeout 1 --max-time 2 http://www.apple.com/ >/dev/null 2>&1 || 
-               timeout ${timeout} curl -s --head --connect-timeout 1 --max-time 2 http://www.cloudflare.com/ >/dev/null 2>&1; then
-                success=$((success + 1))
+            if timeout "${timeout}" curl -s --head --connect-timeout 1 --max-time 2 http://www.google.com/ >/dev/null 2>&1 || 
+               timeout "${timeout}" curl -s --head --connect-timeout 1 --max-time 2 http://www.apple.com/ >/dev/null 2>&1 || 
+               timeout "${timeout}" curl -s --head --connect-timeout 1 --max-time 2 http://www.cloudflare.com/ >/dev/null 2>&1; then
+                success=1
             fi
-        # Fallback to wget if curl is not available
         elif command -v wget >/dev/null 2>&1; then
-            if timeout ${timeout} wget -q --spider http://www.google.com/ >/dev/null 2>&1 || 
-               timeout ${timeout} wget -q --spider http://www.apple.com/ >/dev/null 2>&1 || 
-               timeout ${timeout} wget -q --spider http://www.cloudflare.com/ >/dev/null 2>&1; then
-                success=$((success + 1))
+            if timeout "${timeout}" wget -q --spider http://www.google.com/ >/dev/null 2>&1 || 
+               timeout "${timeout}" wget -q --spider http://www.apple.com/ >/dev/null 2>&1 || 
+               timeout "${timeout}" wget -q --spider http://www.cloudflare.com/ >/dev/null 2>&1; then
+                success=1
             fi
         fi
     fi
     
-    # Success if any check succeeded
     if [ $success -ge 1 ]; then
         return 0
     fi
@@ -2563,101 +3118,134 @@ update_route_status() {
         wan_available="false"
     fi
     
-    # Create the file if it doesn't exist, or truncate it if it does
-    : > "${routestatus_file}"
+    local tmp_file
+    tmp_file=$(mktemp "${status_dir}/routestatus.XXXXXX") || {
+        log_error "Failed to create temporary status file in ${status_dir}"
+        return 1
+    }
+    
+    local now_ts
+    now_ts=$(date +%s)
     
     # Write a timestamp
-    echo "Last Updated: $(date '+%Y-%m-%d %H:%M:%S')" >> "${routestatus_file}"
-    echo "" >> "${routestatus_file}"
-    
-    # Use the passed internet_available parameter instead of checking again
-    local internet_status="${internet_available:-false}"
-    
-    # Overall status section
-    echo "==== MESH NETWORK STATUS ====" >> "${routestatus_file}"
-    echo "Mode: ${mode}" >> "${routestatus_file}"
-    echo "Onboard WAN Available: ${wan_available}" >> "${routestatus_file}"
-    echo "Internet Connection: ${internet_status}" >> "${routestatus_file}"
-    if [ "${wan_available}" = "true" ] && [ -n "${active_wan}" ]; then
-        echo "Active WAN Interface: ${active_wan}" >> "${routestatus_file}"
-    fi
-    echo "Primary Route Configured: ${primary_route}" >> "${routestatus_file}"
-    echo "Fallback Route Configured: ${fallback_route}" >> "${routestatus_file}"
-    echo "" >> "${routestatus_file}"
-    
-    # Routes section
-    echo "==== ACTIVE ROUTES ====" >> "${routestatus_file}"
-    ip route show | grep default | while read -r route; do
-        local route_label=""
+    {
+        echo "Last Updated: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo ""
         
-        # Determine route type based on the interface and metric
-        if echo "${route}" | grep -q "metric 50"; then
-            route_label="[PRIMARY]"
-        elif echo "${route}" | grep -q "metric 100"; then
-            route_label="[PRIMARY MESH]"
-        elif echo "${route}" | grep -q "metric 200"; then
-            route_label="[FALLBACK]"
-        elif echo "${route}" | grep -q "metric"; then
-            route_label="[OTHER]"
-        else
-            route_label="[DEFAULT]"
+        # Use the passed internet_available parameter instead of checking again
+        local internet_status="${internet_available:-false}"
+        
+        echo "==== MESH NETWORK STATUS ===="
+        echo "Mode: ${mode}"
+        echo "Onboard WAN Available: ${wan_available}"
+        echo "Internet Connection: ${internet_status}"
+        if [ "${wan_available}" = "true" ] && [ -n "${active_wan}" ]; then
+            echo "Active WAN Interface: ${active_wan}"
         fi
+        echo "Primary Route Configured: ${primary_route}"
+        echo "Fallback Route Configured: ${fallback_route}"
+        echo ""
         
-        # Format the route with its label
-        echo "${route_label} ${route}" >> "${routestatus_file}"
-    done
-    echo "" >> "${routestatus_file}"
-    
-    # Batman gateway list section
-    echo "==== BATMAN GATEWAYS ====" >> "${routestatus_file}"
-    if command -v batctl >/dev/null 2>&1; then
-        # Get raw gateway list
-        local gw_list=$(batctl gwl)
-        
-        if [ -z "${gw_list}" ] || echo "${gw_list}" | grep -q "No gateways in range"; then
-            echo "No mesh gateways available" >> "${routestatus_file}"
-        else
-            # Extract header line (contains Batman version info)
-            local header=$(echo "${gw_list}" | head -n 1)
-            echo "${header}" >> "${routestatus_file}"
-            
-            # Check if any gateways are listed
-            local gateway_count=$(echo "${gw_list}" | wc -l)
-            if [ "${gateway_count}" -le 2 ]; then
-                echo "No gateway nodes detected" >> "${routestatus_file}"
-            else
-                # Process each line after the headers (skip first 2 lines)
-                echo "${gw_list}" | tail -n +3 | while read -r line; do
-                    if [ -n "${line}" ]; then
-                        # Extract gateway information
-                        local router=$(echo "${line}" | grep -oE '\[[a-zA-Z0-9_-]+\]' | head -1 | tr -d '[]')
-                        local throughput=$(echo "${line}" | grep -oE '\([^)]+\)' | tr -d '()')
-                        local nexthop=$(echo "${line}" | grep -oE '\[[a-zA-Z0-9_-]+\]' | tail -1 | tr -d '[]')
-                        local bandwidth=$(echo "${line}" | grep -oE '[0-9]+\.[0-9]+\/[0-9]+\.[0-9]+ MBit')
-                        
-                        # Check if this is the selected gateway
-                        local selected=""
-                        if echo "${line}" | grep -q "\*"; then
-                            selected=" (SELECTED)"
-                        fi
-                        
-                        # Format the gateway information nicely
-                        echo "Gateway: ${router}${selected}" >> "${routestatus_file}"
-                        echo "  - Throughput: ${throughput}" >> "${routestatus_file}"
-                        echo "  - Next Hop: ${nexthop}" >> "${routestatus_file}"
-                        echo "  - Bandwidth: ${bandwidth}" >> "${routestatus_file}"
-                        echo "" >> "${routestatus_file}"
-                    fi
-                done
+        echo "==== WAN INTERFACE HEALTH ===="
+        local -A _seen_ifaces=()
+        for iface in "${VALID_WAN}" "${ETH_WAN}"; do
+            if [ -n "${iface}" ] && [ -z "${_seen_ifaces[$iface]}" ]; then
+                _seen_ifaces[$iface]=1
+                local iface_state="${WAN_INTERFACE_STATE[$iface]:-unknown}"
+                local iface_fail_streak="${WAN_INTERFACE_FAIL_STREAK[$iface]:-0}"
+                local iface_last_success="${WAN_INTERFACE_LAST_SUCCESS[$iface]:-0}"
+                local iface_last_failure="${WAN_INTERFACE_LAST_FAILURE[$iface]:-0}"
+                local iface_ip
+                iface_ip=$(get_interface_ipv4 "${iface}")
+                
+                echo "Interface: ${iface}"
+                [ -n "${iface_ip}" ] && echo "  IP: ${iface_ip}"
+                echo "  State: ${iface_state}"
+                echo "  Fail Streak: ${iface_fail_streak}"
+                echo "  Last Success: $(format_timestamp_delta "${iface_last_success}" "${now_ts}")"
+                echo "  Last Failure: $(format_timestamp_delta "${iface_last_failure}" "${now_ts}")"
+                echo ""
             fi
+        done
+        
+        if [ ${#_seen_ifaces[@]} -eq 0 ]; then
+            echo "No WAN interfaces tracked."
+            echo ""
         fi
-    else
-        echo "batctl command not available" >> "${routestatus_file}"
+        
+        echo "==== ACTIVE ROUTES ===="
+        ip route show | grep default | while read -r route; do
+            local route_label=""
+            
+            if echo "${route}" | grep -q "metric 50"; then
+                route_label="[PRIMARY]"
+            elif echo "${route}" | grep -q "metric 100"; then
+                route_label="[PRIMARY MESH]"
+            elif echo "${route}" | grep -q "metric 200"; then
+                route_label="[FALLBACK]"
+            elif echo "${route}" | grep -q "metric"; then
+                route_label="[OTHER]"
+            else
+                route_label="[DEFAULT]"
+            fi
+            
+            echo "${route_label} ${route}"
+        done
+        echo ""
+        
+        echo "==== BATMAN GATEWAYS ===="
+        if command -v batctl >/dev/null 2>&1; then
+            local gw_list
+            gw_list=$(batctl gwl)
+            
+            if [ -z "${gw_list}" ] || echo "${gw_list}" | grep -q "No gateways in range"; then
+                echo "No mesh gateways available"
+            else
+                local header
+                header=$(echo "${gw_list}" | head -n 1)
+                echo "${header}"
+                
+                local gateway_count
+                gateway_count=$(echo "${gw_list}" | wc -l)
+                if [ "${gateway_count}" -le 2 ]; then
+                    echo "No gateway nodes detected"
+                else
+                    echo "${gw_list}" | tail -n +3 | while read -r line; do
+                        if [ -n "${line}" ]; then
+                            local router
+                            router=$(echo "${line}" | grep -oE '\[[a-zA-Z0-9_-]+\]' | head -1 | tr -d '[]')
+                            local throughput
+                            throughput=$(echo "${line}" | grep -oE '\([^)]+\)' | tr -d '()')
+                            local nexthop
+                            nexthop=$(echo "${line}" | grep -oE '\[[a-zA-Z0-9_-]+\]' | tail -1 | tr -d '[]')
+                            local bandwidth
+                            bandwidth=$(echo "${line}" | grep -oE '[0-9]+\.[0-9]+\/[0-9]+\.[0-9]+ MBit')
+                            local selected=""
+                            if echo "${line}" | grep -q "\*"; then
+                                selected=" (SELECTED)"
+                            fi
+                            
+                            echo "Gateway: ${router}${selected}"
+                            echo "  - Throughput: ${throughput}"
+                            echo "  - Next Hop: ${nexthop}"
+                            echo "  - Bandwidth: ${bandwidth}"
+                            echo ""
+                        fi
+                    done
+                fi
+            fi
+        else
+            echo "batctl command not available"
+        fi
+    } > "${tmp_file}"
+    
+    if ! mv "${tmp_file}" "${routestatus_file}"; then
+        log_error "Failed to atomically update ${routestatus_file}"
+        rm -f "${tmp_file}"
+        return 1
     fi
     
-    # Set permissions - readable by all
     chmod 644 "${routestatus_file}" 2>/dev/null
-    
     log_debug "Route status file updated: ${routestatus_file}"
 }
 
@@ -2721,9 +3309,6 @@ setup_mesh_network() {
     # Setup DHCP/DNS services after interfaces are ready
     log "Setting up dnsmasq configuration..."
     setup_dnsmasq || log "Warning: dnsmasq setup failed"
-    
-    # Log successful completion
-    log_info "==== MESH NETWORK SETUP COMPLETE ===="
     
     return 0
 }
