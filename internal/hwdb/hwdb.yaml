@@ -1,0 +1,220 @@
+# Trellis hardware database v0.
+#
+# Keyed by USB VID:PID, PCI ID and driver. Values marked "reported" come from
+# public reports and have not been measured on the Trellis bench; the bench
+# procedure in docs/hardware.md replaces them with measured figures.
+#
+# Fields:
+#   match.usb / match.pci   lower-case hex "vendor:product" ids
+#   match.driver            kernel driver name (used when no id matches)
+#   max_power_dbm           per band; power_source says how it was obtained
+#   power_source            measured | datasheet | reported
+#   mesh_point / sae_mesh / mesh_ap_together
+#                           verified | reported | broken | unknown
+#   verified_kernels        kernels on which mesh+SAE was verified
+#   quirks                  free text, shown in the UI
+schema: 0
+entries:
+  - id: mt7612u
+    chipset: MediaTek MT7612U
+    match:
+      usb: ["0e8d:7612", "0846:9053"]
+      driver: mt76x2u
+    max_power_dbm: {2g: 20, 5g: 20}
+    power_source: reported
+    mesh_point: reported
+    sae_mesh: unknown
+    mesh_ap_together: reported
+    verified_kernels: []
+    quirks:
+      - "AP mode: no DFS channels (reported)"
+    notes: Common in Alfa AWUS036ACM and Netgear A6210.
+
+  - id: mt7610u
+    chipset: MediaTek MT7610U
+    match:
+      usb: ["0e8d:7610"]
+      driver: mt76x0u
+    power_source: reported
+    mesh_point: verified          # bench 2026-11-02: 802.11s+SAE link between two Renegades, ch 149
+    sae_mesh: verified            # wrong passphrase refused and blocked; right one joins
+    mesh_ap_together: reported
+    verified_kernels: ["6.1.54 (Libre Computer LTS, batman-adv 2026.3 DKMS)"]
+    quirks:
+      - "1x1 (single spatial stream)"
+      - "Driver reports 14 dBm (2.4 GHz) / 16 dBm (5 GHz)"
+      - "One hop, 20 MHz ch 149, desk distance: VHT-MCS8 NSS1 86.7 Mbit/s link rate, ~51 Mbit/s TCP each way; driver expected throughput ~50 Mbit/s (what BATMAN_V uses)"
+
+  # Reference build (roadmap track R, 2026-11-04). Not yet on the bench:
+  # every figure below is vendor-stated or reported until measured.
+  - id: mt7916
+    chipset: MediaTek MT7916AN
+    match:
+      pci: ["14c3:7906", "14c3:790a"]   # mt7915e device table (reported; confirm with lspci -nn)
+      driver: mt7915e
+    max_power_dbm: {2g: 21, 5g: 20, 6g: 20}
+    power_source: datasheet       # AsiaRF AW7916-AED page: 11g 21 dBm, HE20 MCS9 20 dBm (+/-1.5)
+    mesh_point: unknown
+    sae_mesh: unknown
+    mesh_ap_together: unknown
+    verified_kernels: []
+    quirks:
+      - "Dual-band concurrent: expected as two radios on one PCI address (2.4 GHz, and 5 or 6 GHz); Trellis fingerprints them by band"
+      - "AsiaRF AW7916-AED: M.2 A+E key, PCIe 2.1; needs 3.3 V / 3 A from the slot, up to 9-10 W; fit a heatsink"
+      - "G-band 2T2R 20/40 MHz; A-band 2T3R 2ss up to 160 MHz; 3 IPEX antennas"
+      - "6 GHz mesh may be barred by regulatory rules (indoor low power, AFC): 5 GHz is the expected mesh band"
+      - "Needs MT7916 firmware from linux-firmware (mediatek/mt7916_*.bin, to confirm)"
+    notes: Reference-build Wi-Fi radio (AsiaRF AW7916-AED). Planned roles - mesh on the 5 GHz radio, client AP on the 2.4 GHz radio.
+
+  - id: mm6108
+    chipset: Morse Micro MM6108 (Wi-Fi HaLow)
+    match:
+      driver: morse                 # Morse Micro out-of-tree driver; module name to confirm on the bench
+    power_source: reported
+    mesh_point: unknown
+    sae_mesh: unknown
+    mesh_ap_together: unknown
+    verified_kernels: []
+    quirks:
+      - "S1G (802.11ah); meshd refuses radio.band s1g until track H bring-up is done"
+      - "Seeed Wio-WM6108 (Quectel FGH100M-H): SPI host interface on a mini-PCIe connector; needs an SPI carrier and a device-tree overlay"
+      - "Needs Morse firmware, the module's board configuration (BCF) file and wpa_supplicant_s1g / hostapd_s1g"
+      - "Wio-WM6108 is sold as US915 (902-928 MHz) only"
+    notes: Reference-build HaLow radio (Seeed Wio-WM6108).
+
+  - id: mt7921u
+    chipset: MediaTek MT7921AU
+    match:
+      usb: ["0e8d:7961"]
+      driver: mt7921u
+    power_source: reported
+    mesh_point: unknown
+    sae_mesh: unknown
+    mesh_ap_together: unknown
+    verified_kernels: []
+    quirks:
+      - "Driver present from kernel 5.18; some device IDs missing in older kernels"
+
+  - id: ar9271
+    chipset: Atheros AR9271
+    match:
+      usb: ["0cf3:9271", "040d:3801"]
+      driver: ath9k_htc
+    max_power_dbm: {2g: 20}
+    power_source: reported
+    mesh_point: verified          # bench 2026-11-03: NanoPi R5C, FriendlyElec 6.1.141
+    sae_mesh: verified
+    mesh_ap_together: reported
+    verified_kernels: ["6.1.141 (FriendlyElec, NanoPi R5C)"]
+    # With hardware encryption, unicast this radio sends to mesh peers never
+    # arrives (its broadcasts do, so routes look fine): bench 2026-11-03,
+    # 0 of 248 translation-table responses delivered. Software crypto fixes it.
+    module_params: {nohwcrypt: "1"}
+    quirks:
+      - "2.4 GHz only"
+      - "USB 2 only"
+      - "Needs ath9k_htc nohwcrypt=1 for an encrypted mesh: with hardware crypto its unicast to mesh peers is lost; make deploy sets it, and the adapter must then be replugged (or the node rebooted) once"
+      - "Never reload ath9k_htc with the adapter attached: the firmware upload fails and the radio disappears until it is replugged"
+
+  - id: rt5572
+    chipset: Ralink RT5572
+    match:
+      usb: ["148f:5572"]
+      driver: rt2800usb
+    max_power_dbm: {2g: 18, 5g: 17}
+    power_source: reported
+    mesh_point: verified          # bench 2026-11-03: Pi Zero 2 W joined two Renegades, 2.4 GHz ch 6
+    sae_mesh: verified
+    mesh_ap_together: reported
+    verified_kernels: ["6.18.50+rpt-rpi-v8 (Raspberry Pi OS, Pi Zero 2 W, batman-adv 2026.3 DKMS)"]
+    # Mesh alone works with hardware crypto; once the client AP shares the
+    # radio, unicast to the mesh interface is no longer received (bench
+    # 2026-11-03: batman ping 0/3 with the AP, 3/3 without it, 3/3 with the
+    # AP and nohwcrypt=1).
+    module_params: {nohwcrypt: "1"}
+    quirks:
+      - "Panda Wireless adapters use this chip; the Pi Zero 2 W unit showed 2.4 GHz only"
+      - "rt2800usb reports the regulatory limit as its transmit power (e.g. 30 dBm), not what it sends"
+      - "A second interface on the radio must differ from the first in the low 3 bits of the last byte (the hardware BSS slot), or the mesh stops receiving (bench 2026-11-03)"
+      - "Needs rt2800usb nohwcrypt=1 when the client AP shares the radio: with hardware crypto the mesh then receives no unicast; make deploy sets it"
+
+  - id: rtl88xxau-oot
+    chipset: Realtek RTL8812AU / RTL8814AU (out-of-tree drivers)
+    match:
+      driver: 88XXau
+    power_source: reported
+    mesh_point: broken
+    sae_mesh: broken
+    mesh_ap_together: broken
+    verified_kernels: []
+    quirks:
+      - "Out-of-tree Realtek drivers do not implement mesh point"
+
+  - id: brcmfmac-onboard
+    chipset: Broadcom/Cypress FullMAC (Raspberry Pi onboard Wi-Fi)
+    match:
+      driver: brcmfmac
+    power_source: reported
+    mesh_point: broken
+    sae_mesh: broken
+    mesh_ap_together: broken
+    verified_kernels: []
+    quirks:
+      - "No 802.11s mesh point in the FullMAC firmware: can serve as the client AP only"
+      - "Pi Zero 2 W (CYW43436): 2.4 GHz only. Pi 3B+/4/5 (CYW43455): 2.4 and 5 GHz"
+      - "Often the Wi-Fi a headless Pi is reached through: meshd leaves it alone while it is connected"
+
+  - id: rtl8822ce
+    chipset: Realtek RTL8822CE (M.2, e.g. NanoPi R5C option)
+    match:
+      pci: ["10ec:c822"]
+      driver: rtw_8822ce
+    power_source: reported
+    mesh_point: unknown
+    sae_mesh: unknown
+    mesh_ap_together: unknown
+    verified_kernels: []
+    quirks:
+      - "rtw88 mesh point support depends on the kernel; check meshctl doctor"
+
+  - id: rtl8821cu
+    chipset: Realtek RTL8821CU (USB, 1x1 2.4/5 GHz, e.g. "AC600" nano adapters)
+    match:
+      driver: rtw88_8821cu
+    power_source: reported
+    mesh_point: unknown
+    sae_mesh: unknown
+    mesh_ap_together: unknown
+    verified_kernels: []
+    quirks:
+      - "Pi Zero 2 W, kernel 6.18.50+rpt (2026-11-03): the in-kernel rtw88 driver did not offer mesh point mode, so it can serve as the client AP only"
+      - "Check a given kernel with: iw phy <phy> info | grep -A8 'Supported interface modes'"
+
+  - id: rtl8821cu-oot
+    chipset: Realtek RTL8821CU (out-of-tree rtw88 driver)
+    match:
+      driver: rtw_8821cu
+    power_source: reported
+    mesh_point: unknown
+    sae_mesh: unknown
+    mesh_ap_together: unknown
+    verified_kernels: []
+    quirks:
+      - "Renegade 6.1.54 bench (2026-11-03): offered mesh point, but peers saw repeated SAE failures from it with a matching profile, then bringing up mesh0 failed with EBUSY"
+      - "Ranked below tested adapters; pin it in node.yaml to try it"
+      - "Reports the regulatory limit (30 dBm) as its transmit power"
+
+  - id: intel-iwlwifi
+    chipset: Intel Wi-Fi 6/6E (AX200/AX210 and similar)
+    match:
+      driver: iwlwifi
+    power_source: reported
+    mesh_point: broken
+    sae_mesh: broken
+    mesh_ap_together: broken
+    verified_kernels: []
+    quirks:
+      - "No 802.11s mesh point in iwlwifi: can serve as the client AP only"
+      - "Firmware allows no AP on 5 GHz (every channel is passive-only); the client AP falls back to 2.4 GHz"
+      - "Intel firmware restricts AP mode on 5/6 GHz (location-aware regulatory); expect a 2.4 GHz AP"
+      - "Seen in the NanoPi R5C M.2 slot (bench, 2026-11-03)"

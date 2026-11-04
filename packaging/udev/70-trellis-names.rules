@@ -1,0 +1,12 @@
+# Interfaces Trellis creates (mesh0, ap0, bat0, br-mesh, anycast0).
+#
+# 1. Keep their names. Debian and Ubuntu ship 73-usb-net-by-mac.rules, which
+#    renames any new interface on a USB adapter with a factory MAC to
+#    wlx<mac>, including interfaces created by name through nl80211. Setting
+#    NAME here, before that rule runs, makes it (and 80-net-setup-link.rules)
+#    skip them.
+# 2. Keep NetworkManager off them from the moment they appear. NM honours the
+#    NM_UNMANAGED udev property at device creation; this works even where its
+#    unmanaged-devices configuration has not been reloaded yet.
+ACTION=="add", SUBSYSTEM=="net", KERNEL=="mesh[0-9]|ap[0-9]", NAME="$kernel"
+SUBSYSTEM=="net", KERNEL=="mesh[0-9]|ap[0-9]|bat[0-9]|br-mesh|anycast0", ENV{NM_UNMANAGED}="1"

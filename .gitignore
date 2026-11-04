@@ -1,0 +1,30 @@
+# Build outputs
+/bin/
+/dist/
+*.test
+*.out
+coverage.*
+
+# Lab harness runtime state
+/lab/run/
+
+# Python bytecode (lab scripts)
+__pycache__/
+*.pyc
+
+# AI assistant files and session notes
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+.mcp.json
+handoff.md
+HANDOFF.md
+
+# Editor and OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
+deploy.hosts
+# Mesh profile carried by scripts/deploy.sh; holds the mesh secret
+mesh-profile.yaml

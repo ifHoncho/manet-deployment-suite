@@ -1,0 +1,26 @@
+[Unit]
+Description=Trellis mesh daemon (meshd)
+After=network-pre.target systemd-modules-load.service
+Wants=network-pre.target
+# meshd owns its interfaces; nothing else should configure them.
+Before=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/trellis meshd --node /etc/trellis/node.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=30
+# meshd runs as root in this milestone; capability and sandbox hardening is
+# roadmap M8. The web UI and cotd will run unprivileged (M5, M6).
+ProtectSystem=full
+ReadWritePaths=/var/lib/trellis /run/trellis -/etc/NetworkManager/conf.d -/etc/systemd/network
+RuntimeDirectory=trellis
+RuntimeDirectoryMode=0755
+StateDirectory=trellis
+Environment=GOTRACEBACK=single
+
+[Install]
+WantedBy=multi-user.target

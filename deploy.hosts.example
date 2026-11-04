@@ -1,0 +1,4 @@
+# Bench nodes for scripts/deploy.sh (make deploy). Copy to deploy.hosts,
+# which git ignores. One user@host per line.
+ubuntu@10.0.0.126
+ubuntu@10.0.0.210

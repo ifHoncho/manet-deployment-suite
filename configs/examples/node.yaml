@@ -1,0 +1,34 @@
+# Trellis node configuration (schema v0). One per node.
+# Generate a skeleton with:  meshctl node new --callsign node-1 > /etc/trellis/node.yaml
+schema: 0
+callsign: node-1                 # DNS label: lowercase letters, digits, hyphens
+node_id: 0                       # 1-254 to pin; 0 = automatic (derived from the node MAC until gossip lands in M2)
+profile: /etc/trellis/profile.yaml
+
+radios:
+  roles:
+    mesh: auto                   # auto | disabled | {radio: "mac:00:c0:ca:..."} | {port: "usb:1-1.2"}
+    ap: auto                     # same forms; the AP itself is activated in M2
+    mesh2: auto                  # the profile's second mesh link (radio2); same forms
+  devices: []
+  # devices:
+  #   - match: {port: "usb:1-1.2"}         # or {fingerprint: "mac:..."}
+  #     label: "Alfa AWUS036ACM"
+  #     tx_power_dbm: 20                   # cap this radio
+  #     max_power_dbm: 23                  # override the database value used for ranking
+  #     ignore: false
+
+ports: []
+# ports:
+#   - {name: eth0, role: auto}   # auto | wan | client | mesh
+#   - {name: eth1, role: mesh}   # wired backhaul: eth1 becomes a batman-adv hard interface
+
+ap:
+  enabled: true
+  country: US
+  band: 5g
+  # ssid / passphrase are generated per node when the AP lands (M2)
+
+# tx_power_dbm: 20               # cap the mesh radio below the regulatory maximum
+mesh_mtu: 1560                   # underlay MTU requested on mesh0 (1500 + batman-adv headers)
+allow_old_batman: false          # bench only: run with a batman-adv older than the profile minimum

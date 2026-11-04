@@ -1,0 +1,35 @@
+# Trellis mesh profile (schema v0). One per mesh; identical on every node.
+# Holds the mesh secret: keep it private. Generate a fresh one with
+#   meshctl profile new --name alpha > /etc/trellis/profile.yaml
+schema: 0
+name: alpha                      # human name
+mesh_id: trellis-alpha           # 802.11s mesh ID on the air (max 32 bytes); defaults to name
+sae_passphrase: change-me-to-a-long-random-passphrase
+
+regulatory:
+  mode: country                  # country | unrestricted
+                                 # unrestricted (the design default) needs the Trellis regulatory
+                                 # database, which this build does not ship yet; it falls back to
+                                 # the country below with a warning.
+  country: US                    # ISO 3166-1 alpha-2; also used for the client AP
+
+radio:
+  band: 5g                       # 2g | 5g | 6g   (s1g/HaLow arrives with roadmap track H)
+  channel: 149                   # pick a non-DFS channel: 36-48 or 149-165 on 5 GHz in the US
+  width: 20                      # 20 | 40 | 80 MHz
+# Optional second mesh link on its own radio (mesh1), usually another band:
+# batman-adv uses both links and picks the faster path to each node
+# (architecture §5.2, decision D-09). Nodes without a second suitable radio
+# mesh on the first link only.
+# radio2:
+#   band: 2g
+#   channel: 6
+#   width: 20
+
+prefix: 10.73.0.0/16             # the mesh's flat IPv4 network (nodes are 10.73.N.1)
+
+batman:
+  routing_algo: BATMAN_V
+  orig_interval_ms: 1000
+  min_version: "2024.0"          # meshd refuses to start below this (multicast packet type)
+  pinned_version: "2026.3"       # every node should run exactly this; others get a warning
